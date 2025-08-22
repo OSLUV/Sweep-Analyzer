@@ -27,53 +27,81 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
 
-      - name: Install Linux Tk (for tkinter import at build-time)
+      - name: Install Tk for Linux
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y tk
+          sudo apt-get install -y python3-tk tk
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install --upgrade pip wheel "setuptools<81"
           pip install -r requirements.txt
           pip install pyinstaller==6.11.0
 
       - name: Show versions
         run: |
-          python -V
-          python - << 'PY'
-          import sys, tkinter, matplotlib, numpy, pandas, scipy
-          print("tk:", tkinter.TkVersion)
-          print("matplotlib:", matplotlib.__version__)
-          print("numpy:", numpy.__version__)
-          print("pandas:", pandas.__version__)
-          print("scipy:", scipy.__version__)
-          PY
+          python -c "import sys; print(sys.version)"
+          python -c "import tkinter; print('tk', tkinter.TkVersion)"
+          python -c "import matplotlib, numpy, pandas; print('matplotlib', matplotlib.__version__); print('numpy', numpy.__version__); print('pandas', pandas.__version__)"
+          python -c "import scipy; print('scipy', scipy.__version__)"
 
-      # macOS: build a .app bundle (better UX than onefile on macOS)
+      - name: Prepare macOS icon
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          from PIL import Image
+          Image.new('RGBA',(1024,1024),(0,0,0,0)).save('icon.png')
+          PY
+          mkdir -p icon.iconset
+          for SIZE in 16 32 64 128 256 512 1024; do
+            /usr/bin/sips -z $SIZE $SIZE icon.png --out icon.iconset/icon_${SIZE}x${SIZE}.png >/dev/null
+          done
+          /usr/bin/iconutil -c icns icon.iconset -o app.icns
+
+      # macOS: build a .app bundle with explicit icon (avoids missing default icon issue)
       - name: PyInstaller (macOS .app)
         if: runner.os == 'macOS'
         run: |
           pyinstaller --noconfirm --clean \
             --windowed \
             --name SW3PowerAnalyzer \
-            --collect-data matplotlib --collect-data pandas \
-            --collect-submodules matplotlib \
+            --icon app.icns \
+            --collect-data matplotlib --collect-data pandas --collect-data numpy \
+            --collect-submodules matplotlib --collect-submodules pandas --collect-submodules numpy \
             --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import numpy._core._multiarray_umath \
+            --hidden-import numpy._core._exceptions \
             --hidden-import eegbin --hidden-import util \
             gui.py
 
-      # Windows & Linux: produce single-file binaries for easy distribution
-      - name: PyInstaller (Windows/Linux onefile)
-        if: runner.os != 'macOS'
+      # Linux: prefer onedir for reliability with many binary deps (numpy/scipy)
+      - name: PyInstaller (Linux onedir)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconfirm --clean \
+            --windowed \
+            --name SW3PowerAnalyzer \
+            --collect-data matplotlib --collect-data pandas --collect-data numpy \
+            --collect-submodules matplotlib --collect-submodules pandas --collect-submodules numpy \
+            --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import numpy._core._multiarray_umath \
+            --hidden-import numpy._core._exceptions \
+            --hidden-import eegbin --hidden-import util \
+            gui.py
+
+      # Windows: onefile is OK
+      - name: PyInstaller (Windows onefile)
+        if: runner.os == 'Windows'
         run: |
           pyinstaller --noconfirm --clean \
             --onefile --windowed \
             --name SW3PowerAnalyzer \
-            --collect-data matplotlib --collect-data pandas \
-            --collect-submodules matplotlib \
+            --collect-data matplotlib --collect-data pandas --collect-data numpy \
+            --collect-submodules matplotlib --collect-submodules pandas --collect-submodules numpy \
             --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import numpy._core._multiarray_umath \
+            --hidden-import numpy._core._exceptions \
             --hidden-import eegbin --hidden-import util \
             gui.py
 
@@ -86,7 +114,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Compress-Archive -Path dist\SW3PowerAnalyzer.exe -DestinationPath SW3PowerAnalyzer-windows-${{ runner.arch }}.zip
+          Compress-Archive -Path dist\\SW3PowerAnalyzer.exe -DestinationPath SW3PowerAnalyzer-windows-${{ runner.arch }}.zip
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
