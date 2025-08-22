@@ -1,20 +1,28 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-SW3 + Power Analyzer GUI — vertical layout (Files → Groups → Controls)
+SW3 + Power Analyzer GUI
 
-Key features
+Layout
+------
+• Single vertical stack: Files (top) → Groups (middle) → Controls (bottom)
+
+Capabilities
 ------------
-• Single-column layout: Files (top), Groups (middle), Controls (bottom) — all resizable vertically.
-• Load SW3/eegbin and power CSV, label, group, and associate (many-to-many).
-• Sessions: Save/Load all state (files, groups, associations, offsets, module paths, controls, style).
-• Reload from disk (selected/all) to pick up appended data.
-• Analyses
-  - Intensity vs Time (file or whole group; normalize to 1m; EMA; trims; per-analysis show/hide and alphas)
-  - Optics vs Power (time-series overlay with paired shades; correlation & scatter on-demand)
-  - Group Decay Overlay (EMA % of peak; choose groups; per-analysis toggles)
-• Friendly names in UI and legends (no F###/G### in controls).
-• Plot windows replace older ones automatically (per category).
+• Load SW3/eegbin optical files and power CSV logs
+• Label files; create groups; associate SW3↔Power (many-to-many)
+• **Group-level trimming** (HH:MM:SS) at start and/or end; applied globally:
+  - Intensity vs Time (file & group modes)
+  - Optics vs Power (time series + correlation/scatter/export)
+  - Group Decay Overlay
+• Align streams by epoch timestamps (power resampled to N seconds; nearest-merge with tolerance)
+• Per-analysis controls: show/hide points & EMA lines; independent alphas
+• Friendly names in legends (no F###/G###), paired colors for OVP
+• Sessions save/load everything (files, groups, associations, trims, settings)
 
-Requires: Python 3.9+, numpy, pandas, matplotlib (scipy optional), tkinter (system).
+Notes
+-----
+• No dependency on imgui; a tiny util shim is injected if util.py is missing.
 """
 
 from __future__ import annotations
@@ -29,11 +37,12 @@ from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
+
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib import pyplot as plt
-from matplotlib import cm as mpl_cm
 from matplotlib import colors as mpl_colors
+from matplotlib import colormaps as mpl_colormaps
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -43,54 +52,12 @@ try:
 except Exception:
     scipy_stats = None
 
+# ------------------------------------------------------------------
+# Optional util shim (so importing eegbin doesn't require imgui)
+# ------------------------------------------------------------------
 
-
-def _install_minimal_util_stub():
-    """Provide a minimal 'util' module so eegbin can import without imgui.
-    Only the functions used by various repos are provided as no-ops.
-    """
-    import types, sys as _sys
-    if "util" in _sys.modules:
-        return
-    util = types.ModuleType("util")
-    # ----- no-UI helpers -----
-    def inclusive_range(start, stop, step):
-        if step == 0:
-            return []
-        out = []
-        s = float(start)
-        # mimic original (positive step, inclusive while start <= stop)
-        if step > 0:
-            while s <= stop:
-                out.append(s)
-                s += step
-        else:
-            while s >= stop:
-                out.append(s)
-                s += step
-        return out
-    # ----- imgui-driven edit helpers replaced by safe no-ops -----
-    def do_editable_raw(preamble, value, units="", width=100):
-        # return (changed_flag, value). We never change values here.
-        return (False, value)
-    def do_editable(preamble, value, units="", width=100, enable=True):
-        # just return the original value unchanged
-        return value
-    util.inclusive_range = inclusive_range
-    util.do_editable_raw = do_editable_raw
-    util.do_editable = do_editable
-    _sys.modules["util"] = util
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# lazily loaded
-eegbin = None
-_EXTRA_MODULE_PATHS: List[str] = []
-
-
-# --- Optional util shim (avoids imgui dependency if util.py isn't available) ---
 def _ensure_util_shim():
-    import sys, types
+    import types
     if 'util' in sys.modules:
         return
     util = types.ModuleType('util')
@@ -112,20 +79,22 @@ def _ensure_util_shim():
     util.do_editable_raw = do_editable_raw
     util.do_editable = do_editable
     sys.modules['util'] = util
+
 _ensure_util_shim()
 
-# --- Colormap helper (Matplotlib 3.7+; falls back for older) ---
-try:
-    from matplotlib import colormaps as _mpl_cmaps
-    def _get_cmap(name):
-        return _mpl_cmaps.get_cmap(name)
-except Exception:
-    def _get_cmap(name):
-        from matplotlib import pyplot as _plt
-        return _plt.get_cmap(name)
-# -----------------------------
+# lazily imported module
+eegbin = None
+_EXTRA_MODULE_PATHS: List[str] = []
+
+# ------------------------------------------------------------------
 # Utilities
-# -----------------------------
+# ------------------------------------------------------------------
+
+def _get_cmap(name: str):
+    try:
+        return mpl_colormaps.get_cmap(name)
+    except Exception:
+        return plt.get_cmap(name)
 
 def human_datetime(epoch_s: float) -> str:
     try:
@@ -134,6 +103,7 @@ def human_datetime(epoch_s: float) -> str:
         return ""
 
 def parse_hhmmss(s: str) -> int:
+    """Return seconds (can be negative if string has a leading -)."""
     if s is None:
         return 0
     s = str(s).strip()
@@ -142,10 +112,11 @@ def parse_hhmmss(s: str) -> int:
     if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
         return int(s)
     parts = s.split(":")
+    parts = [p for p in parts if p != ""]
     try:
         parts = [int(p) for p in parts]
-    except Exception:
-        raise ValueError(f"Invalid time format: {s}")
+    except Exception as e:
+        raise ValueError(f"Invalid time format: {s}") from e
     if len(parts) == 2:
         return parts[0]*60 + parts[1]
     if len(parts) == 3:
@@ -167,6 +138,7 @@ def _add_module_path(path: str):
         _EXTRA_MODULE_PATHS.append(path)
 
 def ensure_eegbin_imported():
+    """Add saved module paths; import eegbin (prompts for folder if needed)."""
     global eegbin
     if eegbin is not None:
         return
@@ -177,18 +149,9 @@ def ensure_eegbin_imported():
         eegbin = importlib.import_module("eegbin")
         return
     except ModuleNotFoundError as e1:
-        # If the missing module is 'util' or 'imgui', install a stub and retry
-        missing = getattr(e1, 'name', '')
-        if missing in ('util', 'imgui'):
-            _install_minimal_util_stub()
-            try:
-                eegbin = importlib.import_module('eegbin')
-                return
-            except Exception:
-                pass
         missing = getattr(e1, "name", "eegbin")
         if messagebox.askyesno("Locate module",
-                               "Could not import '{}'.\nSelect the folder containing 'eegbin.py' and 'util.py'."
+                               "Could not import '{}'.\nSelect the folder that contains 'eegbin.py' and 'util.py'."
                                .format(missing)):
             folder = filedialog.askdirectory(title="Select folder containing eegbin.py and util.py")
             if folder:
@@ -199,7 +162,7 @@ def ensure_eegbin_imported():
                 except Exception:
                     pass
         messagebox.showerror("Import error",
-                             "Could not import 'eegbin'. Missing: {}\n"
+                             "Could not import 'eegbin'. Missing: {}\n\n"
                              "Tip: Put gui.py next to eegbin.py/util.py, or use Settings → Add Module Path…".format(missing))
         raise
 
@@ -207,7 +170,7 @@ def ema(arr: np.ndarray, span: int) -> np.ndarray:
     if span <= 1:
         return np.asarray(arr, dtype=float)
     s = pd.Series(arr, dtype="float64")
-    return s.ewm(span=span, adjust=False).mean().to_numpy()
+    return s.ewm(span=int(span), adjust=False).mean().to_numpy()
 
 def linear_regression(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
     if x.size == 0 or y.size == 0:
@@ -234,49 +197,43 @@ def merge_asof_seconds(df_left: pd.DataFrame, df_right: pd.DataFrame, tolerance_
     merged["timestamp_s"] = merged["timestamp"].astype("int64") // 10**9
     return merged
 
-
 def _prepare_power_series(power_df: pd.DataFrame, tmin: float, tmax: float,
                           ema_span: int, resample_seconds: int) -> Optional[pd.DataFrame]:
-    """Select a time window, resample to N seconds, compute EMA. Returns columns ['timestamp','power_ema'].
-       Returns None if empty after processing.
-    """
-    # Select window and needed columns, then copy to avoid SettingWithCopy warnings
+    """Select window, resample, compute EMA; return columns ['timestamp','power_ema'] or None if empty."""
     mask = (power_df["Timestamp"] >= tmin) & (power_df["Timestamp"] <= tmax)
     cols = ["Timestamp", "W_Active"]
     pdf = power_df.loc[mask, cols].copy()
     if pdf.empty:
         return None
-    # Build datetime index and resample
     pdf.loc[:, "timestamp"] = pd.to_datetime(pdf["Timestamp"], unit="s")
     pdf = pdf.set_index("timestamp").sort_index()
-    # Use lowercase 's' to avoid FutureWarning
     pdf = pdf.resample(f"{int(resample_seconds)}s")["W_Active"].mean().to_frame("power")
     pdf.loc[:, "power_ema"] = pdf["power"].ewm(span=int(ema_span), adjust=False).mean()
     pdf = pdf.dropna(subset=["power_ema"]).reset_index()
-    # Back to epoch seconds
     pdf.loc[:, "timestamp"] = pdf["timestamp"].astype("int64") // 10**9
     return pdf[["timestamp", "power_ema"]]
 
-
-def get_cmap_colors(n: int, cmap_name: str="viridis") -> List[Tuple[float, float, float, float]]:
-    cmap = mpl_cm.get_cmap(cmap_name)
+def get_cmap_colors(n: int, cmap_name: str) -> List[Tuple[float, float, float, float]]:
+    cmap = _get_cmap(cmap_name)
     xs = np.linspace(0.1, 0.9, max(1, n))
     return [cmap(x) for x in xs]
 
-def _to_rgb(color):
-    return np.array(mpl_colors.to_rgb(color))
+def _to_rgb(c):
+    return np.array(mpl_colors.to_rgb(c), dtype=float)
 
-def lighten(color, amount=0.5):
+def lighten(color, amount=0.6):
+    """Lighten color by mixing with white; amount in [0..1]."""
     c = _to_rgb(color)
     return tuple(np.clip(1 - (1 - c) * (1 - amount), 0, 1))
 
-def darken(color, amount=0.5):
+def darken(color, amount=0.35):
+    """Darken color by scaling toward black; amount in [0..1]."""
     c = _to_rgb(color)
     return tuple(np.clip(c * (1 - (1 - amount)), 0, 1))
 
-# -----------------------------
+# ------------------------------------------------------------------
 # Data models
-# -----------------------------
+# ------------------------------------------------------------------
 
 @dataclass
 class FileRecord:
@@ -290,25 +247,26 @@ class FileRecord:
 class GroupRecord:
     group_id: str
     name: str
-    offset_s: int = 0
+    trim_start_s: int = 0
+    trim_end_s: int = 0
     file_ids: Set[str] = field(default_factory=set)
     associations: Dict[str, Set[str]] = field(default_factory=dict)  # sw3_id -> set(power_id)
 
-# -----------------------------
+# ------------------------------------------------------------------
 # App
-# -----------------------------
+# ------------------------------------------------------------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SW3 + Power Analyzer")
-        self.geometry("1200x900")
-        self.minsize(900, 700)
+        self.geometry("1320x860")
+        self.minsize(960, 640)
 
         self.files: Dict[str, FileRecord] = {}
         self.groups: Dict[str, GroupRecord] = {}
 
-        # display-name maps
+        # display maps for friendly names
         self._sw3_display_to_id: Dict[str, str] = {}
         self._group_display_to_id: Dict[str, str] = {}
 
@@ -320,7 +278,7 @@ class App(tk.Tk):
         self._init_vars()
         self._build_ui()
 
-        # figure registry
+        # figure registry and aligned cache
         self._figs: Dict[str, List[plt.Figure]] = {"ivt": [], "ovp": [], "gdo": [], "corr": []}
         self._aligned_cache: Optional[pd.DataFrame] = None
 
@@ -330,7 +288,7 @@ class App(tk.Tk):
         self.intensity_ema_span = tk.IntVar(self, value=31)
         self.power_ema_span     = tk.IntVar(self, value=31)
         self.overlay_ema_span   = tk.IntVar(self, value=31)
-        self.trim_start_s       = tk.IntVar(self, value=0)
+        self.trim_start_s       = tk.IntVar(self, value=0)   # retained for IVT-only trim (not group), still useful
         self.trim_end_s         = tk.IntVar(self, value=0)
         self.align_tolerance_s  = tk.IntVar(self, value=2)
         self.ccf_max_lag_s      = tk.IntVar(self, value=180)
@@ -340,7 +298,7 @@ class App(tk.Tk):
         self.normalize_to_1m    = tk.BooleanVar(self, value=True)
         self.only_yaw_roll_zero = tk.BooleanVar(self, value=True)
 
-        # per-analysis style toggles
+        # per-analysis style
         self.ivt_show_points    = tk.BooleanVar(self, value=True)
         self.ivt_show_ema       = tk.BooleanVar(self, value=True)
         self.ivt_point_alpha    = tk.DoubleVar(self, value=0.25)
@@ -357,7 +315,7 @@ class App(tk.Tk):
         self.gdo_point_alpha    = tk.DoubleVar(self, value=0.15)
         self.gdo_line_alpha     = tk.DoubleVar(self, value=1.0)
 
-        # combos (friendly display strings)
+        # combos (friendly)
         self.ivt_sw3_display    = tk.StringVar(self, value="")
         self.ivt_group_display  = tk.StringVar(self, value="")
         self.ovp_group_display  = tk.StringVar(self, value="")
@@ -381,9 +339,9 @@ class App(tk.Tk):
         groups_container = ttk.Frame(self._paned)
         self._controls_frame = ttk.Frame(self._paned)
 
-        self._paned.add(files_container, weight=4)
-        self._paned.add(groups_container, weight=3)
-        self._paned.add(self._controls_frame, weight=2)
+        self._paned.add(files_container, weight=3)
+        self._paned.add(groups_container, weight=2)
+        self._paned.add(self._controls_frame, weight=1)
 
         self._build_files_frame(files_container)
         self._build_groups_frame(groups_container)
@@ -393,12 +351,13 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(self, value="Ready")
         ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill=tk.X, side=tk.BOTTOM)
 
-        # initial vertical sash positions
+        # initial vertical sash positions (favor controls)
         self.after(120, self._set_initial_sashes)
 
     def _build_menu(self):
         menubar = tk.Menu(self)
 
+        # File
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Add SW3…", command=self.on_add_sw3_files)
         file_menu.add_command(label="Add Power CSV…", command=self.on_add_power_files)
@@ -411,6 +370,7 @@ class App(tk.Tk):
         file_menu.add_command(label="Quit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
 
+        # Settings
         settings_menu = tk.Menu(menubar, tearoff=False)
         settings_menu.add_command(label="Power Columns…", command=self.on_set_power_columns)
         settings_menu.add_separator()
@@ -418,16 +378,18 @@ class App(tk.Tk):
         settings_menu.add_command(label="List Module Paths…", command=self.on_list_module_paths)
         menubar.add_cascade(label="Settings", menu=settings_menu)
 
+        # View
         view_menu = tk.Menu(menubar, tearoff=False)
         view_menu.add_checkbutton(label="Show Controls Panel", variable=self.controls_visible, command=self.on_toggle_controls)
         view_menu.add_command(label="Compact Controls Height", command=self.on_compact_controls_height)
-        view_menu.add_command(label="Give Height to Controls", command=self.on_give_height_to_controls)
+        view_menu.add_command(label="Favor Controls Section", command=self.on_favor_controls)
         view_menu.add_separator()
         view_menu.add_command(label="Maximize Files Section", command=self.on_maximize_files)
         view_menu.add_command(label="Maximize Groups Section", command=self.on_maximize_groups)
         view_menu.add_command(label="Maximize Controls Section", command=self.on_maximize_controls)
         menubar.add_cascade(label="View", menu=view_menu)
 
+        # Help
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo(
             "About", "SW3 + Power Analyzer\nAligns SW3/eegbin optical data with power logs by epoch time."
@@ -479,11 +441,11 @@ class App(tk.Tk):
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(top, text="Edit Associations…", command=self.on_edit_associations).pack(side=tk.LEFT, padx=2)
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(top, text="Set Offset…", command=self.on_set_group_offset).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="Clear Offset", command=self.on_clear_group_offset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Set Trim…", command=self.on_set_group_trim).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Clear Trim", command=self.on_clear_group_trim).pack(side=tk.LEFT, padx=2)
 
         container = ttk.Frame(frm); container.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
-        cols = ("name", "offset", "sw3_count", "power_count")
+        cols = ("name", "trim", "sw3_count", "power_count")
         self.tv_groups = ttk.Treeview(container, columns=cols, show="headings", selectmode="browse")
         for c in cols:
             self.tv_groups.heading(c, text=c.capitalize())
@@ -495,6 +457,7 @@ class App(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         container.rowconfigure(0, weight=1); container.columnconfigure(0, weight=1)
+        self.tv_groups.bind("<<TreeviewSelect>>", lambda e: self._on_group_selection_changed())
 
     def _build_controls(self, parent):
         nb = ttk.Notebook(parent)
@@ -592,14 +555,12 @@ class App(tk.Tk):
 
     # ---- View helpers ----
     def _set_initial_sashes(self):
-        """Set initial vertical sash positions with more height for Controls: Files ~35%, Groups ~25%, Controls ~40%."""
+        """Files ~25%, Groups ~30%, Controls ~45%."""
         try:
             self.update_idletasks()
-            total_h = self._paned.winfo_height() or self.winfo_height()
-            if total_h <= 0:
-                total_h = 800
-            pos0 = int(total_h * 0.35)  # Files / Groups divider
-            pos1 = int(total_h * 0.60)  # Groups / Controls divider -> Controls ~40%
+            total_h = self._paned.winfo_height() or self.winfo_height() or 800
+            pos0 = int(total_h * 0.25)
+            pos1 = int(total_h * 0.55)
             self._paned.sashpos(0, pos0)
             self._paned.sashpos(1, pos1)
         except Exception:
@@ -610,7 +571,7 @@ class App(tk.Tk):
         try:
             panes = self._paned.panes()
             if vis and str(self._controls_frame) not in panes:
-                self._paned.add(self._controls_frame, weight=2)
+                self._paned.add(self._controls_frame, weight=1)
             elif not vis and str(self._controls_frame) in panes:
                 self._paned.forget(self._controls_frame)
         except Exception:
@@ -621,57 +582,47 @@ class App(tk.Tk):
         try:
             self.update_idletasks()
             total_h = self._paned.winfo_height()
-            controls_h = 220
-            # place second sash so controls gets ~220px, but keep first sash above it
-            self._paned.sashpos(1, max(self._paned.sashpos(0)+200, total_h - controls_h))
+            # Ensure groups keeps at least ~200 px and controls ~220 px
+            self._paned.sashpos(0, 160)
+            self._paned.sashpos(1, max(360, total_h - 220))
+        except Exception:
+            pass
+
+    def on_favor_controls(self):
+        """Give more height to the Controls section (Files ~25%, Groups ~30%, Controls ~45%)."""
+        try:
+            self._set_initial_sashes()
         except Exception:
             pass
 
     def on_maximize_files(self):
-        """Give almost all height to the Files section."""
         try:
             self.update_idletasks()
             total_h = self._paned.winfo_height()
-            self._paned.sashpos(0, total_h - 80)  # files big
-            self._paned.sashpos(1, total_h - 40)  # groups tiny, controls smaller
+            self._paned.sashpos(0, total_h - 40)
+            self._paned.sashpos(1, total_h - 20)
         except Exception:
             pass
 
     def on_maximize_groups(self):
-        """Give almost all height to the Groups section."""
         try:
             self.update_idletasks()
             total_h = self._paned.winfo_height()
-            self._paned.sashpos(0, 120)        # files small
-            self._paned.sashpos(1, total_h - 40)  # groups big, controls tiny
+            self._paned.sashpos(0, 120)
+            self._paned.sashpos(1, total_h - 40)
         except Exception:
             pass
 
     def on_maximize_controls(self):
-        """Give almost all height to the Controls section."""
         try:
             self.update_idletasks()
             total_h = self._paned.winfo_height()
-            self._paned.sashpos(0, 120)  # files small
-            self._paned.sashpos(1, total_h - 10)  # controls big
+            self._paned.sashpos(0, 120)
+            self._paned.sashpos(1, total_h - 10)
         except Exception:
             pass
 
-    # ---- Files/Groups ----
-    def on_give_height_to_controls(self):
-        """Reduce Files height and give it to Controls (≈35/25/40)."""
-        try:
-            self.update_idletasks()
-            total_h = self._paned.winfo_height() or self.winfo_height()
-            if total_h <= 0:
-                total_h = 800
-            pos0 = int(total_h * 0.35)
-            pos1 = int(total_h * 0.60)
-            self._paned.sashpos(0, pos0)
-            self._paned.sashpos(1, pos1)
-        except Exception:
-            pass
-
+    # ---- File ops ----
     def on_add_sw3_files(self):
         paths = filedialog.askopenfilenames(title="Add SW3/eegbin Files",
                                             filetypes=[("SW3/eegbin", "*.sw3 *.eegbin *.bin *.*")])
@@ -715,8 +666,8 @@ class App(tk.Tk):
     def _meta_from_sweep(self, sweep) -> Dict[str, object]:
         rows = [r for r in sweep.rows if getattr(r, "timestamp", None) is not None]
         ts = [r.timestamp for r in rows]
-        first = min(ts) if ts else None
-        last = max(ts) if ts else None
+        first = float(min(ts)) if ts else None
+        last = float(max(ts)) if ts else None
         return {"first_ts": first, "last_ts": last, "count": len(rows), "lamp_name": getattr(sweep, "lamp_name", "")}
 
     def _load_power_csv_with_meta(self, path: str) -> Tuple[pd.DataFrame, Dict[str, object]]:
@@ -754,7 +705,7 @@ class App(tk.Tk):
         for gid, g in self.groups.items():
             sw3c = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "sw3")
             powc = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "power")
-            self.tv_groups.insert("", "end", iid=gid, values=(g.name, fmt_hhmmss(g.offset_s), sw3c, powc))
+            self.tv_groups.insert("", "end", iid=gid, values=(g.name, self._format_group_trim(g), sw3c, powc))
         self._refresh_group_select_list()
         self._refresh_display_mappings()
 
@@ -796,7 +747,7 @@ class App(tk.Tk):
     def _display_to_group_id(self, disp: str) -> Optional[str]:
         return self._group_display_to_id.get(disp)
 
-    # ---- Actions ----
+    # ---- File actions ----
     def on_rename_file(self):
         sel = self.tv_files.selection()
         if not sel: return
@@ -838,6 +789,7 @@ class App(tk.Tk):
         self._refresh_groups_tv()
         self._set_status(f"Assigned {len(sel)} file(s) to group '{g.name}'.")
 
+    # ---- Groups ----
     def on_new_group(self):
         name = simpledialog.askstring("New Group", "Group name:", parent=self)
         if not name: return
@@ -874,24 +826,72 @@ class App(tk.Tk):
         dlg = AssociationDialog(self, g, sw3s, pows); self.wait_window(dlg)
         if dlg.updated: self._set_status("Updated associations.")
 
-    def on_set_group_offset(self):
+    def _format_group_trim(self, g) -> str:
+        s = fmt_hhmmss(max(0, int(getattr(g, "trim_start_s", 0))))
+        e = fmt_hhmmss(max(0, int(getattr(g, "trim_end_s", 0))))
+        return "—" if (s=="00:00:00" and e=="00:00:00") else f"{s} | {e}"
+
+    def _group_time_window(self, g: GroupRecord) -> Optional[Tuple[float, float]]:
+        """Compute trimmed time window [tmin,tmax] from group's SW3 files and trims.
+           Returns None if window degenerates or no SW3 meta is available.
+        """
+        sw3_times = []
+        for fid in g.file_ids:
+            fr = self.files.get(fid)
+            if fr and fr.kind == "sw3":
+                ft = fr.meta.get("first_ts"); lt = fr.meta.get("last_ts")
+                if isinstance(ft, (int, float)) and isinstance(lt, (int, float)):
+                    sw3_times.append((float(ft), float(lt)))
+        if not sw3_times:
+            return None
+        base_start = min(a for a, _ in sw3_times)
+        base_end   = max(b for _, b in sw3_times)
+        tmin = base_start + max(0, int(getattr(g, "trim_start_s", 0)))
+        tmax = base_end   - max(0, int(getattr(g, "trim_end_s", 0)))
+        if tmax <= tmin:
+            return None
+        return (tmin, tmax)
+
+    def _filter_rows_by_window(self, rows: List[Tuple[float, float]], tmin: Optional[float], tmax: Optional[float]):
+        """Rows is a list of (timestamp, value). Return rows within [tmin, tmax]."""
+        if tmin is None or tmax is None:
+            return rows
+        return [rv for rv in rows if (rv[0] >= tmin and rv[0] <= tmax)]
+
+    def on_set_group_trim(self):
         gid = self._ensure_group_selected_or_prompt()
         if not gid: return
         g = self.groups[gid]
-        cur = fmt_hhmmss(g.offset_s)
-        s = simpledialog.askstring("Set Offset", "Enter offset (HH:MM:SS, can be negative):", initialvalue=cur, parent=self)
-        if s is None: return
-        try: g.offset_s = parse_hhmmss(s)
-        except Exception as e: messagebox.showwarning("Invalid", str(e)); return
-        self._refresh_groups_tv()
+        # Prompt for start and end trim (HH:MM:SS)
+        top = tk.Toplevel(self); top.title(f"Set Trim — {g.name}")
+        ttk.Label(top, text="Start trim (HH:MM:SS):").grid(row=0, column=0, sticky="e", padx=6, pady=6)
+        e_start = ttk.Entry(top, width=16)
+        e_start.insert(0, fmt_hhmmss(max(0, int(getattr(g, "trim_start_s", 0)))))
+        e_start.grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(top, text="End trim (HH:MM:SS):").grid(row=1, column=0, sticky="e", padx=6, pady=6)
+        e_end = ttk.Entry(top, width=16)
+        e_end.insert(0, fmt_hhmmss(max(0, int(getattr(g, "trim_end_s", 0)))))
+        e_end.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        btns = ttk.Frame(top); btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=6, pady=6)
+        def save():
+            try:
+                g.trim_start_s = max(0, parse_hhmmss(e_start.get()))
+                g.trim_end_s   = max(0, parse_hhmmss(e_end.get()))
+            except Exception as ex:
+                messagebox.showwarning("Invalid", str(ex)); return
+            top.destroy()
+            self._refresh_groups_tv()
+        ttk.Button(btns, text="OK", command=save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", command=top.destroy).pack(side=tk.RIGHT, padx=4)
 
-    def on_clear_group_offset(self):
+    def on_clear_group_trim(self):
         gid = self._ensure_group_selected_or_prompt()
         if not gid: return
-        self.groups[gid].offset_s = 0; self._refresh_groups_tv()
+        g = self.groups[gid]
+        g.trim_start_s = 0; g.trim_end_s = 0
+        self._refresh_groups_tv()
 
     def _ensure_group_selected_or_prompt(self) -> Optional[str]:
-        # Pick from groups table
         sel = self.tv_groups.selection()
         if sel: return sel[0]
         if not self.groups:
@@ -900,6 +900,9 @@ class App(tk.Tk):
         idx = simpledialog.askinteger("Select Group", "Enter group number:\n"+ "\n".join(f"{i+1}. {labels[i]}" for i in range(len(labels))),
                                       minvalue=1, maxvalue=len(labels), parent=self)
         return choices[idx-1] if idx else None
+
+    def _on_group_selection_changed(self):
+        pass  # selection is used via friendly comboboxes
 
     # ---- Settings ----
     def on_set_power_columns(self):
@@ -936,8 +939,7 @@ class App(tk.Tk):
         ok=err=0
         for fid in targets:
             rec = self.files.get(fid)
-            if not rec:
-                continue
+            if not rec: continue
             try:
                 if rec.kind=="sw3":
                     with open(rec.path, "rb") as fd: buf = fd.read()
@@ -962,12 +964,12 @@ class App(tk.Tk):
             "module_paths": list(_EXTRA_MODULE_PATHS),
             "files": [asdict(fr) for fr in self.files.values()],
             "groups": [{
-                "group_id": g.group_id, "name": g.name, "offset_s": g.offset_s,
+                "group_id": g.group_id, "name": g.name,
+                "trim_start_s": getattr(g, "trim_start_s", 0), "trim_end_s": getattr(g, "trim_end_s", 0),
                 "file_ids": list(g.file_ids),
-                "associations": {k: list(v) for k,v in g.associations.items()},
+                "associations": {k: list(v) for k, v in g.associations.items()},
             } for g in self.groups.values()],
             "controls": {
-                # common
                 "intensity_ema_span": self.intensity_ema_span.get(),
                 "power_ema_span": self.power_ema_span.get(),
                 "overlay_ema_span": self.overlay_ema_span.get(),
@@ -978,7 +980,6 @@ class App(tk.Tk):
                 "resample_seconds": self.resample_seconds.get(),
                 "normalize_to_1m": self.normalize_to_1m.get(),
                 "only_yaw_roll_zero": self.only_yaw_roll_zero.get(),
-                # per-analysis
                 "ivt_show_points": self.ivt_show_points.get(),
                 "ivt_show_ema": self.ivt_show_ema.get(),
                 "ivt_point_alpha": float(self.ivt_point_alpha.get()),
@@ -992,7 +993,6 @@ class App(tk.Tk):
                 "gdo_show_ema": self.gdo_show_ema.get(),
                 "gdo_point_alpha": float(self.gdo_point_alpha.get()),
                 "gdo_line_alpha": float(self.gdo_line_alpha.get()),
-                # selections
                 "source_mode": self.source_mode.get(),
                 "combine_group_sw3": self.combine_group_sw3.get(),
                 "ivt_sw3_display": self.ivt_sw3_display.get(),
@@ -1015,14 +1015,14 @@ class App(tk.Tk):
         self.files = {fr["file_id"]: FileRecord(**fr) for fr in data.get("files", [])}
         self.groups = {}
         for g in data.get("groups", []):
-            gr = GroupRecord(group_id=g["group_id"], name=g["name"], offset_s=g.get("offset_s",0))
+            gr = GroupRecord(group_id=g["group_id"], name=g["name"],
+                             trim_start_s=g.get("trim_start_s", 0), trim_end_s=g.get("trim_end_s", 0))
             gr.file_ids = set(g.get("file_ids", []))
             gr.associations = {k: set(v) for k,v in g.get("associations", {}).items()}
             self.groups[gr.group_id] = gr
         c = data.get("controls", {})
-        def set_if(k,var): 
+        def set_if(k,var):
             if k in c: var.set(c[k])
-        # restore
         for k,var in [
             ("intensity_ema_span", self.intensity_ema_span),
             ("power_ema_span", self.power_ema_span),
@@ -1055,43 +1055,31 @@ class App(tk.Tk):
             ("controls_visible", self.controls_visible),
         ]: set_if(k,var)
 
-        # refresh UI
         self._refresh_files_tv()
         self._refresh_groups_tv()
         self._refresh_display_mappings()
         self.on_toggle_controls()
         self._set_status(f"Loaded session from {path}")
 
-    # ---- Plot utilities ----
-    def _register_fig(self, cat: str, fig: plt.Figure):
-        self._figs.setdefault(cat, []).append(fig)
-
-    def _close_plots(self, cat: str, also: Tuple[str, ...]=()):
-        cats = (cat,) + tuple(also)
-        for c in cats:
-            figs = self._figs.get(c, [])
-            for f in figs:
-                try: plt.close(f)
-                except Exception: pass
-            self._figs[c] = []
-        # no status set here to avoid flicker
-
-    # ---- Analysis: IVT ----
+    # ------------------------------------------------------------------
+    # Analysis: Intensity vs Time
+    # ------------------------------------------------------------------
     def on_plot_intensity_vs_time(self):
-        # Replace any existing IVT plots
+        # Replace any existing IVT plot(s)
         self._close_plots('ivt')
 
+        mode = self.source_mode.get()
         ema_span = int(self.intensity_ema_span.get())
         trim_start = int(self.trim_start_s.get())
         trim_end   = int(self.trim_end_s.get())
         only_zero  = self.only_yaw_roll_zero.get()
         norm_1m    = self.normalize_to_1m.get()
-        p_alpha    = float(self.ivt_point_alpha.get())
-        l_alpha    = float(self.ivt_line_alpha.get())
         show_pts   = self.ivt_show_points.get()
         show_line  = self.ivt_show_ema.get()
+        p_alpha    = float(self.ivt_point_alpha.get())
+        l_alpha    = float(self.ivt_line_alpha.get())
 
-        def rows_from_sw3(fid: str, offset_s: int = 0):
+        def rows_from_sw3(fid: str):
             rec = self.files.get(fid)
             if not rec or rec.kind != "sw3": return []
             try:
@@ -1111,64 +1099,74 @@ class App(tk.Tk):
                     dist_m = float(getattr(r.coords,"lin_mm",0.0) or 0.0)/1000.0
                     if dist_m > 0: I_wm2 = I_wm2*(dist_m**2)
                 I_uW_cm2 = I_wm2*100.0
-                out.append((float(r.timestamp)+offset_s, I_uW_cm2))
+                out.append((float(r.timestamp), I_uW_cm2))
             out.sort(key=lambda x: x[0])
             return out
 
         fig = plt.figure(); ax = fig.add_subplot(111)
 
-        if self.source_mode.get() == "file":
+        if mode == "file":
             disp = self.ivt_sw3_display.get()
             fid = self._display_to_sw3_id(disp)
             if not fid:
-                messagebox.showinfo("Plot", "Select an SW3 file (friendly name)."); return
-            g_offset = 0
-            for g in self.groups.values():
-                if fid in g.file_ids: g_offset = g.offset_s; break
-            rows = rows_from_sw3(fid, g_offset)
-            if not rows: messagebox.showinfo("Plot", "No rows after filtering."); return
-            t = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows])
-            t0 = t[0]
-            if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
-            if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
-            if t.size==0: messagebox.showinfo("Plot", "No data after trim."); return
+                messagebox.showinfo("Plot", "Select an SW3 file."); return
+            rows = rows_from_sw3(fid)
+
+            # Apply per-action trim (seconds) relative to series start
+            if rows:
+                t = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows])
+                t0 = t[0]
+                if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
+                if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
+                # If the file belongs to a trimmed group, clip to group window as well
+                for g in self.groups.values():
+                    if fid in g.file_ids:
+                        win = self._group_time_window(g)
+                        if win is not None:
+                            tmin, tmax = win
+                            mask = (t >= tmin) & (t <= tmax)
+                            t, y = t[mask], y[mask]
+                        break
+            else:
+                messagebox.showinfo("Plot", "No rows after filtering."); return
+
+            if t.size==0:
+                messagebox.showinfo("Plot", "No data to plot after trims."); return
             y_ema = ema(y, ema_span)
             th = (t - t[0]) / 3600.0
             if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{self.files[fid].label} (raw)")
-            if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA (span={ema_span})")
+            if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA")
         else:
             gdisp = self.ivt_group_display.get()
             gid = self._display_to_group_id(gdisp)
-            if not gid or gid not in self.groups: messagebox.showinfo("Plot", "Select a Group (friendly name)."); return
+            if not gid or gid not in self.groups: messagebox.showinfo("Plot", "Select a Group."); return
             g = self.groups[gid]
+            win = self._group_time_window(g)
             sw3_ids = [fid for fid in g.file_ids if self.files.get(fid) and self.files[fid].kind=="sw3"]
             if not sw3_ids: messagebox.showinfo("Plot", "No SW3 files in this group."); return
             colors = get_cmap_colors(len(sw3_ids), "viridis")
             if self.combine_group_sw3.get():
                 all_rows = []
-                for fid in sw3_ids: all_rows.extend(rows_from_sw3(fid, g.offset_s))
+                for fid in sw3_ids:
+                    all_rows.extend(rows_from_sw3(fid))
+                if win is not None and all_rows:
+                    tmin, tmax = win
+                    all_rows = self._filter_rows_by_window(all_rows, tmin, tmax)
                 if not all_rows: messagebox.showinfo("Plot", "No rows after filtering."); return
                 all_rows.sort(key=lambda x: x[0])
                 t = np.array([r[0] for r in all_rows]); y = np.array([r[1] for r in all_rows])
-                t0 = t[0]
-                if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
-                if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
-                if t.size==0: messagebox.showinfo("Plot", "No data after trim."); return
-                y_ema = ema(y, ema_span)
-                th = (t - t[0]) / 3600.0
+                y_ema = ema(y, ema_span); th = (t - t[0]) / 3600.0
                 if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{g.name} (raw)")
-                if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{g.name} EMA (span={ema_span})")
+                if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{g.name} EMA")
             else:
                 for i, fid in enumerate(sw3_ids):
-                    rows = rows_from_sw3(fid, g.offset_s)
+                    rows = rows_from_sw3(fid)
+                    if win is not None and rows:
+                        tmin, tmax = win
+                        rows = self._filter_rows_by_window(rows, tmin, tmax)
                     if not rows: continue
                     t = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows])
-                    t0 = t[0]
-                    if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
-                    if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
-                    if t.size==0: continue
-                    y_ema = ema(y, ema_span)
-                    th = (t - t[0]) / 3600.0
+                    y_ema = ema(y, ema_span); th = (t - t[0]) / 3600.0
                     c = colors[i]
                     if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{self.files[fid].label} (raw)", color=c)
                     if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA", color=c)
@@ -1182,7 +1180,9 @@ class App(tk.Tk):
         self._register_fig('ivt', fig)
         plt.show(block=False)
 
-    # ---- Analysis: OVP ----
+    # ------------------------------------------------------------------
+    # Analysis: Build aligned frame for a group (applies group trims)
+    # ------------------------------------------------------------------
     def _build_aligned_for_group(self, gid: str) -> Optional[pd.DataFrame]:
         g = self.groups.get(gid)
         if not g or not g.associations:
@@ -1194,6 +1194,8 @@ class App(tk.Tk):
         norm_1m   = self.normalize_to_1m.get()
 
         frames = []
+        win = self._group_time_window(g)
+
         for sw3_id, pow_ids in g.associations.items():
             sw3_rec = self.files.get(sw3_id)
             if not sw3_rec or sw3_rec.kind!="sw3":
@@ -1216,35 +1218,42 @@ class App(tk.Tk):
                     dist_m = float(getattr(r.coords,"lin_mm",0.0) or 0.0)/1000.0
                     if dist_m>0: I_wm2 = I_wm2*(dist_m**2)
                 I_uW_cm2 = I_wm2*100.0
-                sw_rows.append((float(r.timestamp)+g.offset_s, I_uW_cm2))
-            if not sw_rows: continue
-            sw_rows.sort(key=lambda x:x[0])
+                sw_rows.append((float(r.timestamp), I_uW_cm2))
+
+            if win is not None and sw_rows:
+                tmin, tmax = win
+                sw_rows = self._filter_rows_by_window(sw_rows, tmin, tmax)
+            if not sw_rows:
+                continue
+
             t_sw = np.array([r[0] for r in sw_rows], dtype=float)
             y_sw = np.array([r[1] for r in sw_rows], dtype=float)
             df_sw = pd.DataFrame({"timestamp": t_sw, "intensity_ema": ema(y_sw, ema_int)})
 
+            # Build per power file
             for pid in pow_ids:
-                pow_rec = self.files.get(pid)
+                pow_rec = self.files.get(pid); 
                 if not pow_rec or pow_rec.kind!="power": continue
                 try:
                     power_df, _ = self._load_power_csv_with_meta(pow_rec.path)
                 except Exception as e:
                     messagebox.showwarning("Load error", f"Failed to load CSV {pow_rec.path}\n{e}"); continue
-                # clip to SW3 window ± tol
-                tmin = t_sw.min() - tol_s; tmax = t_sw.max() + tol_s
-                pdf = power_df[(power_df["Timestamp"]>=tmin) & (power_df["Timestamp"]<=tmax)]
-                if pdf.empty: continue
-                pdf["timestamp"] = pd.to_datetime(pdf["Timestamp"], unit="s")
-                pdf = pdf.set_index("timestamp").sort_index()
-                pdf = pdf.resample(f"{self.resample_seconds.get()}s")["W_Active"].mean().to_frame("power")
-                pdf["power_ema"] = pdf["power"].ewm(span=ema_pow, adjust=False).mean()
-                pdf = pdf.dropna(subset=["power_ema"]).reset_index()
-                pdf["timestamp"] = pdf["timestamp"].astype("int64") // 10**9
 
-                df_join = merge_asof_seconds(df_sw, pdf[["timestamp","power_ema"]], tol_s).dropna(subset=["power_ema"])
-                if df_join.empty: continue
+                # Determine power window from trimmed sw window ± tol
+                sw_tmin = t_sw.min(); sw_tmax = t_sw.max()
+                if win is not None:
+                    sw_tmin, sw_tmax = win
+                tmin = sw_tmin - tol_s; tmax = sw_tmax + tol_s
+
+                pdf = _prepare_power_series(power_df, tmin, tmax, ema_pow, int(self.resample_seconds.get()))
+                if pdf is None: 
+                    continue
+
+                df_join = merge_asof_seconds(df_sw, pdf, tol_s).dropna(subset=["power_ema"])
+                if df_join.empty: 
+                    continue
                 df_join["group_id"] = gid
-                df_join["sw3_id"] = sw3_id
+                df_join["sw3_id"]   = sw3_id
                 df_join["power_id"] = pid
                 df_join["sw3_label"] = sw3_rec.label
                 df_join["power_label"] = pow_rec.label
@@ -1255,6 +1264,9 @@ class App(tk.Tk):
         aligned = pd.concat(frames, ignore_index=True).sort_values("timestamp_s")
         return aligned
 
+    # ------------------------------------------------------------------
+    # Analysis: OVP (time series) and correlation/scatter
+    # ------------------------------------------------------------------
     def on_analyze_group(self):
         # Replace any existing OVP plot(s)
         self._close_plots('ovp')
@@ -1262,7 +1274,7 @@ class App(tk.Tk):
         gdisp = self.ovp_group_display.get()
         gid = self._display_to_group_id(gdisp)
         if not gid or gid not in self.groups:
-            messagebox.showinfo("Analyze", "Select a Group (friendly name)."); return
+            messagebox.showinfo("Analyze", "Select a Group."); return
         aligned = self._build_aligned_for_group(gid)
         if aligned is None or aligned.empty:
             messagebox.showinfo("Analyze", "No aligned data could be formed."); return
@@ -1274,21 +1286,24 @@ class App(tk.Tk):
         p_alpha  = float(self.ovp_point_alpha.get())
         l_alpha  = float(self.ovp_line_alpha.get())
 
-        # Build paired colors per (sw3_id, power_id) to avoid duplicates; label with friendly names
-        pair_keys = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])) )
+        # Build paired colors per (sw3_id, power_id)
+        pair_keys = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
         base_colors = get_cmap_colors(len(pair_keys), "viridis")
         fig = plt.figure(); ax1 = fig.add_subplot(111); ax2 = ax1.twinx()
-        # global t0 so all pairs share the same time origin
+
+        # global origin for readability
         t0_global = aligned["timestamp_s"].min()
+
         for i, (sw_id, pow_id) in enumerate(pair_keys):
             dfp = aligned[(aligned["sw3_id"]==sw_id) & (aligned["power_id"]==pow_id)]
             if dfp.empty: continue
-            th = (dfp["timestamp_s"] - t0_global) / 3600.0
+            th = (dfp["timestamp_s"].to_numpy() - t0_global) / 3600.0
             base = base_colors[i]
             c_int = darken(base, 0.35)   # darker for intensity
             c_pow = lighten(base, 0.60)  # lighter for power
-            sw_label = self.files[sw_id].label if sw_id in self.files else str(sw_id)
-            pw_label = self.files[pow_id].label if pow_id in self.files else str(pow_id)
+            sw_label = dfp["sw3_label"].iloc[0]
+            pw_label = dfp["power_label"].iloc[0]
+
             if show_int:
                 ax1.plot(th, dfp["intensity_ema"].to_numpy(), label=f"{sw_label} (optical irradiance)", alpha=l_alpha, color=c_int, linewidth=2)
             if show_pow:
@@ -1300,14 +1315,16 @@ class App(tk.Tk):
         ax1.set_ylabel("Intensity (µW/cm²)")
         ax2.set_ylabel("Power (W)")
         ax1.grid(True, linestyle="--", alpha=0.5)
+
+        # deduplicate legend
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        # Deduplicate legend entries by label
         seen = {}
-        for h,lab in zip(lines1+lines2, labels1+labels2):
+        for h, lab in zip(lines1+lines2, labels1+labels2):
             if lab not in seen:
                 seen[lab] = h
         ax2.legend(list(seen.values()), list(seen.keys()), loc="best")
+
         ax1.set_title(f"Optical irradiance and power vs time — {self.groups[gid].name}")
         fig.tight_layout()
         self._register_fig('ovp', fig)
@@ -1319,6 +1336,7 @@ class App(tk.Tk):
         self._close_plots('corr')
 
         if self._aligned_cache is None or self._aligned_cache.empty:
+            # Try to build from selected group
             gdisp = self.ovp_group_display.get()
             gid = self._display_to_group_id(gdisp)
             if gid and gid in self.groups:
@@ -1334,9 +1352,12 @@ class App(tk.Tk):
         lags = np.arange(-int(self.ccf_max_lag_s.get()), int(self.ccf_max_lag_s.get())+1, 1, dtype=int)
         ccf_vals = []
         for lag in lags:
-            if lag < 0: x_lag = x[-lag:]; y_lag = y[:len(x_lag)]
-            elif lag > 0: y_lag = y[lag:]; x_lag = x[:len(y_lag)]
-            else: x_lag = x; y_lag = y
+            if lag < 0:
+                x_lag = x[-lag:]; y_lag = y[:len(x_lag)]
+            elif lag > 0:
+                y_lag = y[lag:];  x_lag = x[:len(y_lag)]
+            else:
+                x_lag = x; y_lag = y
             if x_lag.size==0 or y_lag.size==0 or np.std(x_lag)==0 or np.std(y_lag)==0:
                 ccf_vals.append(np.nan)
             else:
@@ -1354,21 +1375,23 @@ class App(tk.Tk):
             y_text = np.nanmax(ccf_vals) if np.isfinite(ccf_vals).any() else 0.0
             axc.text(best_lag, y_text, f"best lag={best_lag}s\nr={best_ccf:.3f}", ha="center", va="bottom")
         axc.set_title("Cross‑correlation")
-        axc.set_xlabel("Lag (s) [positive = intensity lags power]"); axc.set_ylabel("Correlation")
-        axc.grid(True, linestyle="--", alpha=0.5); fig_ccf.tight_layout()
-        self._register_fig('corr', fig_ccf); plt.show(block=False)
+        axc.set_xlabel("Lag (s) [positive = intensity lags power]")
+        axc.set_ylabel("Correlation")
+        axc.grid(True, linestyle="--", alpha=0.5)
+        fig_ccf.tight_layout()
+        self._register_fig('corr', fig_ccf)
+        plt.show(block=False)
 
         # 2) Scatter + regression
         slope, intercept, r_lin = linear_regression(aligned["power_ema"].to_numpy(), aligned["intensity_ema"].to_numpy())
         fig_sc = plt.figure(); axs = fig_sc.add_subplot(111)
-        # color per pair
+        # color per pair (use friendly labels)
         pair_keys = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
         base_colors = get_cmap_colors(len(pair_keys), "viridis")
         for i, (sw_id, pow_id) in enumerate(pair_keys):
             dfp = aligned[(aligned["sw3_id"]==sw_id) & (aligned["power_id"]==pow_id)]
-            sw_label = self.files[sw_id].label if sw_id in self.files else str(sw_id)
-            pw_label = self.files[pow_id].label if pow_id in self.files else str(pow_id)
-            axs.scatter(dfp["power_ema"], dfp["intensity_ema"], s=10, alpha=0.25, label=f"{sw_label} vs {pw_label}", color=base_colors[i])
+            axs.scatter(dfp["power_ema"], dfp["intensity_ema"], s=10, alpha=0.25,
+                        label=f"{dfp['sw3_label'].iloc[0]} vs {dfp['power_label'].iloc[0]}", color=base_colors[i])
         if np.isfinite(slope) and np.isfinite(intercept):
             xs = np.linspace(aligned["power_ema"].min(), aligned["power_ema"].max(), 200)
             ys = slope*xs + intercept
@@ -1389,9 +1412,11 @@ class App(tk.Tk):
         df[keep].to_csv(path, index=False)
         self._set_status(f"Exported aligned CSV to {path}")
 
-    # ---- Analysis: Group Decay Overlay ----
+    # ------------------------------------------------------------------
+    # Analysis: Group Decay Overlay (applies trim)
+    # ------------------------------------------------------------------
     def on_plot_group_decay(self, selected_only: bool):
-        # Replace any existing GDO plots
+        # Replace any existing GDO plot(s)
         self._close_plots('gdo')
 
         ema_span = int(self.overlay_ema_span.get())
@@ -1416,6 +1441,7 @@ class App(tk.Tk):
         for i, gid in enumerate(gids):
             g = self.groups.get(gid); 
             if not g: continue
+            win = self._group_time_window(g)
             sw3_ids = [fid for fid in g.file_ids if self.files.get(fid) and self.files[fid].kind=="sw3"]
             rows_all = []
             for sid in sw3_ids:
@@ -1436,7 +1462,10 @@ class App(tk.Tk):
                         dist_m = float(getattr(r.coords,"lin_mm",0.0) or 0.0)/1000.0
                         if dist_m>0: I_wm2 = I_wm2*(dist_m**2)
                     I_uW_cm2 = I_wm2*100.0
-                    rows_all.append((float(r.timestamp)+g.offset_s, I_uW_cm2))
+                    rows_all.append((float(r.timestamp), I_uW_cm2))
+            if win is not None and rows_all:
+                tmin, tmax = win
+                rows_all = self._filter_rows_by_window(rows_all, tmin, tmax)
             if not rows_all: continue
             rows_all.sort(key=lambda x:x[0])
             t = np.array([r[0] for r in rows_all]); y = np.array([r[1] for r in rows_all])
@@ -1452,7 +1481,20 @@ class App(tk.Tk):
         ax.grid(True, linestyle="--", alpha=0.5); ax.legend()
         fig.tight_layout(); self._register_fig('gdo', fig); plt.show(block=False)
 
-    # ---- Plot helpers ----
+    # ---- Plot utils ----
+    def _register_fig(self, cat: str, fig: plt.Figure):
+        self._figs.setdefault(cat, []).append(fig)
+
+    def _close_plots(self, cat: str, also: Tuple[str, ...]=()):
+        cats = (cat,) + tuple(also)
+        for c in cats:
+            figs = self._figs.get(c, [])
+            for f in figs:
+                try: plt.close(f)
+                except Exception: pass
+            self._figs[c] = []
+        self._set_status(f"Closed {', '.join(cats)} plot windows.")
+
     def _select_all_groups(self):
         self.lb_groups_select.selection_set(0, tk.END)
 
@@ -1481,13 +1523,16 @@ class App(tk.Tk):
         while f"G{i:03d}" in self.groups: i+=1
         return f"G{i:03d}"
 
-# ---- Association dialog ----
+# ------------------------------------------------------------------
+# Association dialog (friendly labels; shows full mapping)
+# ------------------------------------------------------------------
 
 class AssociationDialog(tk.Toplevel):
     def __init__(self, master: App, group: GroupRecord, sw3_list, power_list):
         super().__init__(master)
         self.title(f"Associations for '{group.name}'"); self.resizable(True, True)
         self.group = group; self.updated = False
+        self.master = master
 
         pane = ttk.Panedwindow(self, orient=tk.HORIZONTAL); pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         left = ttk.Frame(pane); pane.add(left, weight=1)
@@ -1508,7 +1553,7 @@ class AssociationDialog(tk.Toplevel):
         ttk.Button(btns, text="Remove mapping", command=self._remove_mapping).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=3)
 
-        self.tv_map = ttk.Treeview(self, columns=("sw3", "powers"), show="headings", height=6)
+        self.tv_map = ttk.Treeview(self, columns=("sw3", "powers"), show="headings", height=8)
         self.tv_map.heading("sw3", text="SW3"); self.tv_map.heading("powers", text="Power")
         self.tv_map.column("sw3", stretch=True, width=260); self.tv_map.column("powers", stretch=True, width=480)
         self.tv_map.pack(fill=tk.BOTH, expand=True, padx=6, pady=6); self._refresh_mapping()
@@ -1534,23 +1579,20 @@ class AssociationDialog(tk.Toplevel):
         self.updated = True; self._refresh_mapping()
 
     def _refresh_mapping(self):
-        for item in self.tv_map.get_children():
-            self.tv_map.delete(item)
-        # Always show FULL mapping with friendly labels so it never looks like it was substituted
+        for item in self.tv_map.get_children(): self.tv_map.delete(item)
+        # Always list full mapping with friendly labels
         for sw_id, pset in sorted(self.group.associations.items()):
-            try:
-                sw_label = self.master.files[sw_id].label
-            except Exception:
-                sw_label = sw_id
+            try: sw_label = self.master.files[sw_id].label
+            except Exception: sw_label = sw_id
             power_labels = []
             for pid in sorted(list(pset)):
-                try:
-                    power_labels.append(self.master.files[pid].label)
-                except Exception:
-                    power_labels.append(pid)
-            self.tv_map.insert("", "end", values=(f"{sw_label} ({sw_id})", ", ".join(power_labels)))
+                try: power_labels.append(self.master.files[pid].label)
+                except Exception: power_labels.append(pid)
+            self.tv_map.insert("", "end", values=(sw_label, ", ".join(power_labels)))
 
-# ---- Entrypoint ----
+# ------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------
 
 def main():
     app = App()
