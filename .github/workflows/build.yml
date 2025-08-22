@@ -1,0 +1,121 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - "v*"
+  pull_request:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} (py ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-13, macos-14]
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Linux Tk (for tkinter import at build-time)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tk
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.0
+
+      - name: Show versions
+        run: |
+          python -V
+          python - << 'PY'
+          import sys, tkinter, matplotlib, numpy, pandas, scipy
+          print("tk:", tkinter.TkVersion)
+          print("matplotlib:", matplotlib.__version__)
+          print("numpy:", numpy.__version__)
+          print("pandas:", pandas.__version__)
+          print("scipy:", scipy.__version__)
+          PY
+
+      # macOS: build a .app bundle (better UX than onefile on macOS)
+      - name: PyInstaller (macOS .app)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --clean \
+            --windowed \
+            --name SW3PowerAnalyzer \
+            --collect-data matplotlib --collect-data pandas \
+            --collect-submodules matplotlib \
+            --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import eegbin --hidden-import util \
+            gui.py
+
+      # Windows & Linux: produce single-file binaries for easy distribution
+      - name: PyInstaller (Windows/Linux onefile)
+        if: runner.os != 'macOS'
+        run: |
+          pyinstaller --noconfirm --clean \
+            --onefile --windowed \
+            --name SW3PowerAnalyzer \
+            --collect-data matplotlib --collect-data pandas \
+            --collect-submodules matplotlib \
+            --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import eegbin --hidden-import util \
+            gui.py
+
+      - name: List dist/
+        run: ls -R dist
+        shell: bash
+
+      # Package artifacts per-OS
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Compress-Archive -Path dist\SW3PowerAnalyzer.exe -DestinationPath SW3PowerAnalyzer-windows-${{ runner.arch }}.zip
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tar -C dist -czf SW3PowerAnalyzer-linux-${{ runner.arch }}.tar.gz SW3PowerAnalyzer
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "dist/SW3PowerAnalyzer.app" "SW3PowerAnalyzer-macos-${{ runner.arch }}.zip"
+
+      # Upload artifacts for PRs/branches
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SW3PowerAnalyzer-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            SW3PowerAnalyzer-*.zip
+            SW3PowerAnalyzer-*.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Attach artifacts to a GitHub Release when pushing a tag v*
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            SW3PowerAnalyzer-*.zip
+            SW3PowerAnalyzer-*.tar.gz
