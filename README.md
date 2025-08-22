@@ -54,6 +54,8 @@ See [`.github/workflows/build.yml`](.github/workflows/build.yml) for details.
 
 The macOS `.app` bundle is **unsigned**. Open it via right-click → Open (or code sign & notarize with your Apple Developer ID). You will then need to open System Settings → Privacy and Security → Security and click "Open Anyway"
 
+![MacOS Security Check](https://github.com/OSLUV/Sweep-Analyzer/blob/main/mac_security.png)
+
 
 ## Notes
 
