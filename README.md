@@ -3,6 +3,8 @@
 Tkinter GUI to align and analyze **SW3/eegbin** optical measurements with **electrical power** logs (CSV).  
 Includes grouping, many-to-many associations, global **trimming (HH:MM:SS)**, and plots: **Intensity vs Time**, **Optics vs Power**, **Decay Overlay**, and correlation/scatter.
 
+![Quick Start Guide - How To](https://github.com/OSLUV/Sweep-Analyzer/blob/main/HowTo.png)
+
 ## Run locally
 
 ```bash
