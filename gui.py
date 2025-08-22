@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GUI for analyzing goniometer .sw3/eegbin files alongside electrical power logs.
+SW3 + Power Analyzer GUI
 
-Features
---------
-• Load multiple SW3/eegbin files and multiple power CSV files
-• Label/rename files; view quick metadata (first/last timestamp, sample count)
-• Create multiple Groups; assign files to groups
-• Associate SW3 file(s) with one or more power file(s) inside each group
-• Align by absolute epoch timestamps (1 s resample for power); tolerance configurable
-• Perform analyses equivalent to original scripts:
-    - Intensity vs Time (Yaw=0°, Roll=0°, normalized to 1 m, EMA, trim start/end)
-    - Optics vs Power (EMA, dual‑axis time series, Pearson r, cross‑correlation,
-      scatter + regression, export aligned CSV)
-    - Group Decay Overlay (EMA, normalized to % of peak; per‑group offset)
+Key features
+------------
+• Load SW3/eegbin optical files and power CSV logs
+• Label files; create groups; associate SW3↔Power (many-to-many)
+• Align by absolute epoch timestamps (power resampled to 1 s, nearest-merge with tolerance)
+• Analyses
+  - Intensity vs Time (file or whole group; normalize to 1m; EMA; trims)
+  - Optics vs Power (time-series overlay — correlation/scatter on-demand)
+  - Group Decay Overlay (EMA as % of peak; choose groups)
 
-New in this build
------------------
-• **Reload Files**: reload selected/all files from disk.
-• **Resizable panes**: left column split is resizable; tables have scrollbars.
-• **Module Paths**: Settings → *Add Module Path…* so you can point the app at
-  your `goniometer_software` repo (where `eegbin.py` and `util.py` live). If
-  `eegbin`/`util` import fails, the app will prompt you to locate the folder and
-  retry automatically. Paths are saved in the project JSON.
+Recent changes based on feedback
+--------------------------------
+• **Association dialog**: supports multiple SW3 mapped to the same power without substitution; preview shows **ALL mappings** with friendly names.
+• **Friendly dropdowns** for IVT/OVP use file labels & group names (disambiguated with [F###]/[G###] only when needed).
+• **Auto-close old plots** when you click a Plot button; plus explicit “Close … Plots” per tab.
+• **OVP line styling**: solid lines only, with **paired shades** (dark for *Intensity*, light for *Power*) to remain readable with dense data.
+• **Per-analysis controls**: Show/Hide Points & EMA + separate alpha sliders.
+• **Legends** use “`<sw3 label> (optical)`” and “`<csv label> (power)`” (no arrows).
 
-Run
----
-    python gui.py
+Requirements: Python 3.9+, numpy, pandas, matplotlib (scipy optional).
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -41,68 +35,62 @@ import traceback
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple, Set
 
-# --- Third‑party ---
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib import pyplot as plt
+from matplotlib import cm as mpl_cm
+from matplotlib import colors as mpl_colors
 
-# --- Tkinter UI ---
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-# --- Optional SciPy for stats ---
 try:
     from scipy import stats as scipy_stats
 except Exception:
     scipy_stats = None
 
-# Delay import of eegbin until needed (so the GUI can open without all deps installed)
+# Lazily loaded module for SW3 parsing
 eegbin = None
-
-# Track extra module search paths (saved to project)
 _EXTRA_MODULE_PATHS: List[str] = []
 
 # -----------------------------
-# Utility helpers
+# Utilities
 # -----------------------------
 
 def human_datetime(epoch_s: float) -> str:
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch_s))
     except Exception:
-        return "?"
+        return ""
 
 def parse_hhmmss(s: str) -> int:
-    """Return seconds from 'HH:MM:SS' (or 'MM:SS' or integer seconds)."""
     if s is None:
         return 0
     s = str(s).strip()
     if not s:
         return 0
-    if s.isdigit() or (s.startswith('-') and s[1:].isdigit()):
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
         return int(s)
-    parts = s.split(':')
+    parts = s.split(":")
     try:
         parts = [int(p) for p in parts]
     except Exception:
         raise ValueError(f"Invalid time format: {s}")
     if len(parts) == 2:
-        mm, ss = parts
-        return mm*60 + ss
+        return parts[0]*60 + parts[1]
     if len(parts) == 3:
-        hh, mm, ss = parts
-        return hh*3600 + mm*60 + ss
+        return parts[0]*3600 + parts[1]*60 + parts[2]
     raise ValueError(f"Invalid time format: {s}")
 
 def fmt_hhmmss(seconds: int) -> str:
     neg = seconds < 0
-    seconds = abs(int(seconds))
-    hh = seconds // 3600
-    mm = (seconds % 3600) // 60
-    ss = seconds % 60
-    return f"-{hh:02d}:{mm:02d}:{ss:02d}" if neg else f"{hh:02d}:{mm:02d}:{ss:02d}"
+    s = abs(int(seconds))
+    hh, rem = divmod(s, 3600)
+    mm, ss = divmod(rem, 60)
+    out = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    return f"-{out}" if neg else out
 
 def _add_module_path(path: str):
     if path and path not in sys.path:
@@ -111,27 +99,21 @@ def _add_module_path(path: str):
         _EXTRA_MODULE_PATHS.append(path)
 
 def ensure_eegbin_imported():
-    """Try to import eegbin; if util or other local deps are missing,
-    prompt the user to locate the repo folder and retry.
-    """
     global eegbin
     if eegbin is not None:
         return
     import importlib
-    # First, honor any saved extra paths
     for p in list(_EXTRA_MODULE_PATHS):
         _add_module_path(p)
-
     try:
         eegbin = importlib.import_module("eegbin")
         return
     except ModuleNotFoundError as e1:
         missing = getattr(e1, "name", "eegbin")
-        # Ask the user to locate the folder containing eegbin.py and util.py
         if messagebox.askyesno(
             "Locate module",
-            f"Could not import '{missing}'.\n\n"
-            f"Select the folder that contains your goniometer code (e.g., where 'eegbin.py' and 'util.py' live)."
+            "Could not import '{}'.\nSelect the folder containing 'eegbin.py' and 'util.py'."
+            .format(missing)
         ):
             folder = filedialog.askdirectory(title="Select folder containing eegbin.py and util.py")
             if folder:
@@ -139,73 +121,59 @@ def ensure_eegbin_imported():
                 try:
                     eegbin = importlib.import_module("eegbin")
                     return
-                except Exception as e2:
-                    # As a last resort, try loading eegbin.py directly from the chosen folder
-                    try:
-                        import importlib.util, os
-                        path = os.path.join(folder, "eegbin.py")
-                        if os.path.exists(path):
-                            spec = importlib.util.spec_from_file_location("eegbin", path)
-                            mod = importlib.util.module_from_spec(spec)
-                            sys.modules["eegbin"] = mod
-                            spec.loader.exec_module(mod)  # type: ignore
-                            eegbin = mod
-                            return
-                    except Exception:
-                        pass
-        # Failed
+                except Exception:
+                    pass
         messagebox.showerror("Import error",
-                             f"Could not import 'eegbin'.\n"
-                             f"Missing module: {missing}\n\n"
-                             f"Tip: Put gui.py in the same folder as eegbin.py and util.py, or use Settings → Add Module Path…")
+                             "Could not import 'eegbin'. Missing: {}\n\n"
+                             "Tip: Put gui.py next to eegbin.py/util.py, or use Settings → Add Module Path…".format(missing))
         raise
 
-def ema_series(series: np.ndarray, span: int) -> np.ndarray:
-    """Simple EMA using pandas for numerical stability; fall back if needed."""
+def ema(arr: np.ndarray, span: int) -> np.ndarray:
     if span <= 1:
-        return np.asarray(series, dtype=float)
-    try:
-        s = pd.Series(series, dtype='float64')
-        return s.ewm(span=span, adjust=False).mean().to_numpy()
-    except Exception:
-        # Lightweight fallback
-        alpha = 2 / (span + 1.0)
-        y = np.empty_like(series, dtype=float)
-        y[0] = series[0]
-        for i in range(1, len(series)):
-            y[i] = alpha*series[i] + (1-alpha)*y[i-1]
-        return y
+        return np.asarray(arr, dtype=float)
+    s = pd.Series(arr, dtype="float64")
+    return s.ewm(span=span, adjust=False).mean().to_numpy()
 
 def linear_regression(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
-    """Return slope, intercept, r (Pearson). Uses SciPy if available, else numpy."""
-    if len(x) == 0 or len(y) == 0:
+    if x.size == 0 or y.size == 0:
         return float("nan"), float("nan"), float("nan")
     if scipy_stats is not None:
         r = scipy_stats.pearsonr(x, y)[0]
         slope, intercept, *_ = scipy_stats.linregress(x, y)
-        return slope, intercept, r
-    # Fallbacks
+        return float(slope), float(intercept), float(r)
     if np.std(x) == 0 or np.std(y) == 0:
         return float("nan"), float("nan"), 0.0
-    r = np.corrcoef(x, y)[0,1]
+    r = float(np.corrcoef(x, y)[0,1])
     slope, intercept = np.polyfit(x, y, 1)
-    return float(slope), float(intercept), float(r)
+    return float(slope), float(intercept), r
 
 def merge_asof_seconds(df_left: pd.DataFrame, df_right: pd.DataFrame, tolerance_s: int) -> pd.DataFrame:
-    """Nearest merge on seconds‑resolution timestamps with tolerance."""
     left = df_left.copy()
     right = df_right.copy()
-    left['timestamp'] = pd.to_datetime(left['timestamp'], unit='s')
-    right['timestamp'] = pd.to_datetime(right['timestamp'], unit='s')
-    left = left.sort_values('timestamp')
-    right = right.sort_values('timestamp')
-    merged = pd.merge_asof(
-        left, right,
-        on='timestamp', direction='nearest', tolerance=pd.Timedelta(seconds=tolerance_s)
-    )
-    # Convert back to float epoch seconds for export convenience
-    merged['timestamp_s'] = merged['timestamp'].astype('int64') // 10**9
+    left["timestamp"] = pd.to_datetime(left["timestamp"], unit="s")
+    right["timestamp"] = pd.to_datetime(right["timestamp"], unit="s")
+    left = left.sort_values("timestamp")
+    right = right.sort_values("timestamp")
+    merged = pd.merge_asof(left, right, on="timestamp", direction="nearest",
+                           tolerance=pd.Timedelta(seconds=int(tolerance_s)))
+    merged["timestamp_s"] = merged["timestamp"].astype("int64") // 10**9
     return merged
+
+def get_cmap_colors(n: int, cmap_name: str) -> List[Tuple[float, float, float, float]]:
+    cmap = mpl_cm.get_cmap(cmap_name)
+    xs = np.linspace(0.1, 0.9, max(1, n))
+    return [cmap(x) for x in xs]
+
+def _to_rgb(color):
+    return np.array(mpl_colors.to_rgb(color))
+
+def lighten(color, amount=0.6):
+    c = _to_rgb(color)
+    return tuple(np.clip(1 - (1 - c) * (1 - amount), 0, 1))
+
+def darken(color, amount=0.35):
+    c = _to_rgb(color)
+    return tuple(np.clip(c * (1 - (1 - amount)), 0, 1))
 
 # -----------------------------
 # Data models
@@ -213,8 +181,8 @@ def merge_asof_seconds(df_left: pd.DataFrame, df_right: pd.DataFrame, tolerance_
 
 @dataclass
 class FileRecord:
-    file_id: str                   # stable key
-    kind: str                      # 'sw3' or 'power'
+    file_id: str
+    kind: str   # 'sw3' or 'power'
     path: str
     label: str
     meta: Dict[str, object] = field(default_factory=dict)
@@ -224,113 +192,122 @@ class GroupRecord:
     group_id: str
     name: str
     offset_s: int = 0
-    file_ids: Set[str] = field(default_factory=set)  # sw3 and/or power
-    # Associations: map sw3 file_id -> set of power file_ids
-    associations: Dict[str, Set[str]] = field(default_factory=dict)
+    file_ids: Set[str] = field(default_factory=set)
+    associations: Dict[str, Set[str]] = field(default_factory=dict)  # sw3_id -> set(power_id)
 
 # -----------------------------
-# Core app
+# App
 # -----------------------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SW3 + Power Analyzer")
-        self.geometry("1280x800")
-        self.minsize(900, 600)
+        self.geometry("1320x840")
+        self.minsize(960, 620)
 
-        # State
         self.files: Dict[str, FileRecord] = {}
         self.groups: Dict[str, GroupRecord] = {}
+
+        # display-name maps for friendly dropdowns
+        self._sw3_display_to_id: Dict[str, str] = {}
+        self._group_display_to_id: Dict[str, str] = {}
 
         self.power_column_map = {
             "timestamp": ["Timestamp", "timestamp", "epoch", "Epoch", "time", "Time"],
             "watts": ["W_Active", "watts", "Watts", "Power_W", "W"]
         }
 
-        self._init_control_vars()
+        self._init_vars()
         self._build_ui()
 
-        # Last generated figure (for quick save)
-        self._last_fig: Optional[plt.Figure] = None
+        # figure registry (auto-close support)
+        self._figs: Dict[str, List[plt.Figure]] = {"ivt": [], "ovp": [], "gdo": [], "corr": []}
+        self._aligned_cache: Optional[pd.DataFrame] = None
 
-    # -------------------------
-    # Tk variables
-    # -------------------------
-    def _init_control_vars(self):
-        self.intensity_ema_span   = tk.IntVar(self, value=31)
-        self.power_ema_span       = tk.IntVar(self, value=31)
-        self.trim_start_s         = tk.IntVar(self, value=0)
-        self.trim_end_s           = tk.IntVar(self, value=0)
-        self.align_tolerance_s    = tk.IntVar(self, value=2)
-        self.ccf_max_lag_s        = tk.IntVar(self, value=180)
+    # ---- control vars ----
+    def _init_vars(self):
+        # analysis params
+        self.intensity_ema_span = tk.IntVar(self, value=31)
+        self.power_ema_span     = tk.IntVar(self, value=31)
+        self.overlay_ema_span   = tk.IntVar(self, value=31)
+        self.trim_start_s       = tk.IntVar(self, value=0)
+        self.trim_end_s         = tk.IntVar(self, value=0)
+        self.align_tolerance_s  = tk.IntVar(self, value=2)
+        self.ccf_max_lag_s      = tk.IntVar(self, value=180)
+        self.resample_seconds   = tk.IntVar(self, value=1)
 
-        self.group_offset_hms     = tk.StringVar(self, value="00:00:00")
-        self.overlay_ema_span     = tk.IntVar(self, value=31)
+        # filters
+        self.normalize_to_1m    = tk.BooleanVar(self, value=True)
+        self.only_yaw_roll_zero = tk.BooleanVar(self, value=True)
 
-        self.normalize_to_1m      = tk.BooleanVar(self, value=True)
-        self.only_yaw_roll_zero   = tk.BooleanVar(self, value=True)
+        # per-analysis style toggles
+        self.ivt_show_points    = tk.BooleanVar(self, value=True)
+        self.ivt_show_ema       = tk.BooleanVar(self, value=True)
+        self.ivt_point_alpha    = tk.DoubleVar(self, value=0.25)
+        self.ivt_line_alpha     = tk.DoubleVar(self, value=1.0)
 
-        self.resample_seconds     = tk.IntVar(self, value=1)
+        self.ovp_show_points    = tk.BooleanVar(self, value=False)
+        self.ovp_show_int_ema   = tk.BooleanVar(self, value=True)
+        self.ovp_show_pow_ema   = tk.BooleanVar(self, value=True)
+        self.ovp_point_alpha    = tk.DoubleVar(self, value=0.15)
+        self.ovp_line_alpha     = tk.DoubleVar(self, value=1.0)
 
-        self.selected_group_id    = tk.StringVar(self, value="")
-        self.selected_sw3_id      = tk.StringVar(self, value="")
+        self.gdo_show_points    = tk.BooleanVar(self, value=False)
+        self.gdo_show_ema       = tk.BooleanVar(self, value=True)
+        self.gdo_point_alpha    = tk.DoubleVar(self, value=0.15)
+        self.gdo_line_alpha     = tk.DoubleVar(self, value=1.0)
 
-    # -------------------------
-    # UI layout
-    # -------------------------
+        # friendly combos
+        self.ivt_sw3_display    = tk.StringVar(self, value="")
+        self.ivt_group_display  = tk.StringVar(self, value="")
+        self.ovp_group_display  = tk.StringVar(self, value="")
+
+        # IVT source mode
+        self.source_mode        = tk.StringVar(self, value="file")  # 'file' or 'group'
+        self.combine_group_sw3  = tk.BooleanVar(self, value=True)
+
+        # UI
+        self.controls_visible   = tk.BooleanVar(self, value=True)
+
+    # ---- UI ----
     def _build_ui(self):
         self._build_menu()
 
-        root = self
-        main = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
-        main.pack(fill=tk.BOTH, expand=True)
+        self._paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        self._paned.pack(fill=tk.BOTH, expand=True)
 
-        # Left: files + groups (now vertically resizable)
-        left = ttk.Frame(main)
-        main.add(left, weight=1)
-
-        left_panes = ttk.Panedwindow(left, orient=tk.VERTICAL)
-        left_panes.pack(fill=tk.BOTH, expand=True)
+        left = ttk.Frame(self._paned); self._paned.add(left, weight=2)
+        left_panes = ttk.Panedwindow(left, orient=tk.VERTICAL); left_panes.pack(fill=tk.BOTH, expand=True)
 
         files_container = ttk.Frame(left_panes)
         groups_container = ttk.Frame(left_panes)
         left_panes.add(files_container, weight=3)
         left_panes.add(groups_container, weight=2)
 
-        # Right: analysis tabs
-        right = ttk.Frame(main)
-        main.add(right, weight=4)
+        self._controls = ttk.Frame(self._paned); self._paned.add(self._controls, weight=3)
 
-        # Files frame
         self._build_files_frame(files_container)
-
-        # Groups frame
         self._build_groups_frame(groups_container)
+        self._build_controls(self._controls)
 
-        # Tabs
-        self._notebook = ttk.Notebook(right)
-        self._notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self._build_tab_intensity_vs_time()
-        self._build_tab_optics_vs_power()
-        self._build_tab_group_decay()
-
-        # Status bar
+        # status
         self.status_var = tk.StringVar(self, value="Ready")
-        status = ttk.Label(root, textvariable=self.status_var, anchor="w")
-        status.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.after(120, self._set_initial_sashes)
 
     def _build_menu(self):
         menubar = tk.Menu(self)
 
         file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Add SW3...", command=self.on_add_sw3_files)
-        file_menu.add_command(label="Add Power CSV...", command=self.on_add_power_files)
+        file_menu.add_command(label="Add SW3…", command=self.on_add_sw3_files)
+        file_menu.add_command(label="Add Power CSV…", command=self.on_add_power_files)
         file_menu.add_separator()
         file_menu.add_command(label="Reload Files", command=self.on_reload_all_files)
         file_menu.add_separator()
-        file_menu.add_command(label="Save Project...", command=self.on_save_project)
-        file_menu.add_command(label="Load Project...", command=self.on_load_project)
+        file_menu.add_command(label="Save Session…", command=self.on_save_session)
+        file_menu.add_command(label="Load Session…", command=self.on_load_session)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -342,10 +319,17 @@ class App(tk.Tk):
         settings_menu.add_command(label="List Module Paths…", command=self.on_list_module_paths)
         menubar.add_cascade(label="Settings", menu=settings_menu)
 
+        view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu.add_checkbutton(label="Show Controls Panel", variable=self.controls_visible, command=self.on_toggle_controls)
+        view_menu.add_command(label="Compact Controls Width", command=self.on_compact_controls_width)
+        view_menu.add_separator()
+        view_menu.add_command(label="Maximize Files Pane", command=self.on_maximize_files)
+        view_menu.add_command(label="Maximize Groups Pane", command=self.on_maximize_groups)
+        menubar.add_cascade(label="View", menu=view_menu)
+
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo(
-            "About",
-            "SW3 + Power Analyzer\n\nAligns SW3/eegbin optical data with power logs by epoch time."
+            "About", "SW3 + Power Analyzer\nAligns SW3/eegbin optical data with power logs by epoch time."
         ))
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -355,33 +339,23 @@ class App(tk.Tk):
         frm = ttk.LabelFrame(parent, text="Files")
         frm.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        # Container so we can grid tree + scrollbars
-        container = ttk.Frame(frm)
-        container.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        container = ttk.Frame(frm); container.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
 
-        # Treeview
         cols = ("label", "kind", "first", "last", "count", "path")
         self.tv_files = ttk.Treeview(container, columns=cols, show="headings", selectmode="extended")
         for c in cols:
             self.tv_files.heading(c, text=c.capitalize())
-            # Make columns stretchable
             w = 140 if c not in ("path", "label") else 220
             self.tv_files.column(c, width=w, anchor="w", stretch=True)
-
-        # Scrollbars
         vsb = ttk.Scrollbar(container, orient="vertical", command=self.tv_files.yview)
         hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tv_files.xview)
         self.tv_files.configure(yscroll=vsb.set, xscroll=hsb.set)
-
-        # Grid layout
         self.tv_files.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1); container.columnconfigure(0, weight=1)
 
-        btns = ttk.Frame(frm)
-        btns.pack(fill=tk.X, padx=3, pady=3)
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X, padx=3, pady=3)
         ttk.Button(btns, text="Add SW3…", command=self.on_add_sw3_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Add Power CSV…", command=self.on_add_power_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Rename…", command=self.on_rename_file).pack(side=tk.LEFT, padx=2)
@@ -407,1069 +381,1038 @@ class App(tk.Tk):
         ttk.Button(top, text="Set Offset…", command=self.on_set_group_offset).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="Clear Offset", command=self.on_clear_group_offset).pack(side=tk.LEFT, padx=2)
 
-        # Container for tree + scrollbars
-        container = ttk.Frame(frm)
-        container.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
-
-        # Groups list
+        container = ttk.Frame(frm); container.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
         cols = ("name", "offset", "sw3_count", "power_count")
         self.tv_groups = ttk.Treeview(container, columns=cols, show="headings", selectmode="browse")
         for c in cols:
             self.tv_groups.heading(c, text=c.capitalize())
             self.tv_groups.column(c, width=150, anchor="w", stretch=True)
-
         vsb = ttk.Scrollbar(container, orient="vertical", command=self.tv_groups.yview)
         hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tv_groups.xview)
         self.tv_groups.configure(yscroll=vsb.set, xscroll=hsb.set)
-
         self.tv_groups.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
-
+        container.rowconfigure(0, weight=1); container.columnconfigure(0, weight=1)
         self.tv_groups.bind("<<TreeviewSelect>>", lambda e: self._on_group_selection_changed())
 
-    def _build_tab_intensity_vs_time(self):
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="Intensity vs Time")
+    def _build_controls(self, parent):
+        nb = ttk.Notebook(parent)
+        nb.pack(fill=tk.X, expand=False, padx=6, pady=6)
 
-        controls = ttk.Frame(tab)
-        controls.pack(fill=tk.X, padx=6, pady=6)
+        # ---- Intensity vs Time ----
+        tab_ivt = ttk.Frame(nb); nb.add(tab_ivt, text="Intensity vs Time")
+        r0 = ttk.Frame(tab_ivt); r0.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(r0, text="Source:").pack(side=tk.LEFT, padx=3)
+        ttk.Radiobutton(r0, text="File", value="file", variable=self.source_mode).pack(side=tk.LEFT)
+        ttk.Radiobutton(r0, text="Group", value="group", variable=self.source_mode).pack(side=tk.LEFT)
+        ttk.Label(r0, text="SW3 File:").pack(side=tk.LEFT, padx=(12,3))
+        self.cb_ivt_sw3 = ttk.Combobox(r0, state="readonly", width=34, textvariable=self.ivt_sw3_display)
+        self.cb_ivt_sw3.pack(side=tk.LEFT, padx=3)
+        ttk.Label(r0, text="Group:").pack(side=tk.LEFT, padx=(12,3))
+        self.cb_ivt_group = ttk.Combobox(r0, state="readonly", width=28, textvariable=self.ivt_group_display)
+        self.cb_ivt_group.pack(side=tk.LEFT, padx=3)
+        ttk.Checkbutton(tab_ivt, text="Combine group SW3s into one series", variable=self.combine_group_sw3).pack(anchor="w", padx=10)
 
-        ttk.Label(controls, text="SW3:").pack(side=tk.LEFT, padx=3)
-        self.cb_sw3 = ttk.Combobox(controls, state="readonly", width=40, textvariable=self.selected_sw3_id)
-        self.cb_sw3.pack(side=tk.LEFT, padx=3)
+        r1 = ttk.Frame(tab_ivt); r1.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(r1, text="EMA span:").pack(side=tk.LEFT, padx=3)
+        ttk.Entry(r1, textvariable=self.intensity_ema_span, width=6).pack(side=tk.LEFT, padx=3)
+        ttk.Label(r1, text="Trim start:").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(r1, textvariable=self.trim_start_s, width=8).pack(side=tk.LEFT, padx=3); ttk.Label(r1, text="s").pack(side=tk.LEFT)
+        ttk.Label(r1, text="Trim end:").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(r1, textvariable=self.trim_end_s, width=8).pack(side=tk.LEFT, padx=3); ttk.Label(r1, text="s").pack(side=tk.LEFT)
+        ttk.Checkbutton(r1, text="Normalize to 1m", variable=self.normalize_to_1m).pack(side=tk.LEFT, padx=12)
+        ttk.Checkbutton(r1, text="Yaw=0 & Roll=0 only", variable=self.only_yaw_roll_zero).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(controls, text="EMA span:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.intensity_ema_span, width=6).pack(side=tk.LEFT, padx=3)
+        r2 = ttk.Frame(tab_ivt); r2.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Checkbutton(r2, text="Show points", variable=self.ivt_show_points).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Checkbutton(r2, text="Show EMA", variable=self.ivt_show_ema).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Label(r2, text="Points α:").pack(side=tk.LEFT); tk.Scale(r2, variable=self.ivt_point_alpha, from_=0, to=1, resolution=0.05, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT, padx=6)
+        ttk.Label(r2, text="EMA α:").pack(side=tk.LEFT); tk.Scale(r2, variable=self.ivt_line_alpha, from_=0.1, to=1, resolution=0.05, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(controls, text="Trim start:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.trim_start_s, width=8).pack(side=tk.LEFT, padx=3)
-        ttk.Label(controls, text="s").pack(side=tk.LEFT)
+        r3 = ttk.Frame(tab_ivt); r3.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(r3, text="Plot", command=self.on_plot_intensity_vs_time).pack(side=tk.LEFT, padx=3)
+        ttk.Button(r3, text="Save Figure…", command=self.on_save_last_figure).pack(side=tk.LEFT, padx=3)
+        ttk.Button(r3, text="Close IVT Plots", command=lambda: self._close_plots('ivt')).pack(side=tk.LEFT, padx=10)
+        ttk.Label(tab_ivt, text="Trim accepts seconds (e.g., 90) or HH:MM:SS (e.g., 00:01:30).").pack(anchor="w", padx=10)
 
-        ttk.Label(controls, text="Trim end:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.trim_end_s, width=8).pack(side=tk.LEFT, padx=3)
-        ttk.Label(controls, text="s").pack(side=tk.LEFT)
-
-        ttk.Checkbutton(controls, text="Normalize to 1 m", variable=self.normalize_to_1m).pack(side=tk.LEFT, padx=6)
-        ttk.Checkbutton(controls, text="Yaw=0 & Roll=0 only", variable=self.only_yaw_roll_zero).pack(side=tk.LEFT, padx=6)
-
-        btns = ttk.Frame(tab); btns.pack(fill=tk.X, padx=6, pady=6)
-        ttk.Button(btns, text="Plot", command=self.on_plot_intensity_vs_time).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="Save Figure…", command=self.on_save_last_figure).pack(side=tk.LEFT, padx=3)
-
-        note = ttk.Label(tab, text="Trim accepts seconds (e.g. 90) or HH:MM:SS (e.g. 00:01:30).")
-        note.pack(anchor="w", padx=6)
-
-    def _build_tab_optics_vs_power(self):
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="Optics vs Power")
-
-        controls = ttk.Frame(tab)
-        controls.pack(fill=tk.X, padx=6, pady=6)
-
-        ttk.Label(controls, text="Group:").pack(side=tk.LEFT, padx=3)
-        self.cb_group = ttk.Combobox(controls, state="readonly", width=40, textvariable=self.selected_group_id)
+        # ---- Optics vs Power ----
+        tab_ovp = ttk.Frame(nb); nb.add(tab_ovp, text="Optics vs Power")
+        o1 = ttk.Frame(tab_ovp); o1.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(o1, text="Group:").pack(side=tk.LEFT, padx=3)
+        self.cb_group = ttk.Combobox(o1, state="readonly", width=38, textvariable=self.ovp_group_display)
         self.cb_group.pack(side=tk.LEFT, padx=3)
+        ttk.Label(o1, text="Intensity EMA:").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(o1, textvariable=self.intensity_ema_span, width=6).pack(side=tk.LEFT)
+        ttk.Label(o1, text="Power EMA:").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(o1, textvariable=self.power_ema_span, width=6).pack(side=tk.LEFT)
+        ttk.Label(o1, text="Align tol:").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(o1, textvariable=self.align_tolerance_s, width=6).pack(side=tk.LEFT); ttk.Label(o1, text="s").pack(side=tk.LEFT)
 
-        ttk.Label(controls, text="Intensity EMA:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.intensity_ema_span, width=6).pack(side=tk.LEFT, padx=3)
+        o2 = ttk.Frame(tab_ovp); o2.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Checkbutton(o2, text="Show points", variable=self.ovp_show_points).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Checkbutton(o2, text="Show Intensity EMA", variable=self.ovp_show_int_ema).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Checkbutton(o2, text="Show Power EMA", variable=self.ovp_show_pow_ema).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Label(o2, text="Points α:").pack(side=tk.LEFT); tk.Scale(o2, variable=self.ovp_point_alpha, from_=0, to=1, resolution=0.05, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT, padx=6)
+        ttk.Label(o2, text="Lines α:").pack(side=tk.LEFT); tk.Scale(o2, variable=self.ovp_line_alpha, from_=0.1, to=1, resolution=0.05, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(controls, text="Power EMA:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.power_ema_span, width=6).pack(side=tk.LEFT, padx=3)
+        o3 = ttk.Frame(tab_ovp); o3.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(o3, text="Analyze Group (Time Series)", command=self.on_analyze_group).pack(side=tk.LEFT, padx=3)
+        ttk.Button(o3, text="Correlation & Scatter", command=self.on_corr_and_scatter).pack(side=tk.LEFT, padx=3)
+        ttk.Button(o3, text="Export Aligned CSV…", command=self.on_export_aligned_csv).pack(side=tk.LEFT, padx=3)
+        ttk.Button(o3, text="Save Figure…", command=self.on_save_last_figure).pack(side=tk.LEFT, padx=3)
+        ttk.Button(o3, text="Close OVP Plots", command=lambda: self._close_plots('ovp', also=('corr',))).pack(side=tk.LEFT, padx=10)
 
-        ttk.Label(controls, text="Align tol:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.align_tolerance_s, width=6).pack(side=tk.LEFT, padx=3)
-        ttk.Label(controls, text="s").pack(side=tk.LEFT)
+        # ---- Group Decay Overlay ----
+        tab_gdo = ttk.Frame(nb); nb.add(tab_gdo, text="Group Decay Overlay")
+        g1 = ttk.Frame(tab_gdo); g1.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(g1, text="EMA span:").pack(side=tk.LEFT, padx=3)
+        ttk.Entry(g1, textvariable=self.overlay_ema_span, width=6).pack(side=tk.LEFT, padx=3)
+        ttk.Checkbutton(g1, text="Show points", variable=self.gdo_show_points).pack(side=tk.LEFT, padx=(12,8))
+        ttk.Checkbutton(g1, text="Show EMA", variable=self.gdo_show_ema).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Label(g1, text="Points α:").pack(side=tk.LEFT); tk.Scale(g1, variable=self.gdo_point_alpha, from_=0, to=1, resolution=0.05, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT, padx=6)
+        ttk.Label(g1, text="Lines α:").pack(side=tk.LEFT); tk.Scale(g1, variable=self.gdo_line_alpha, from_=0.1, to=1, resolution=0.05, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT, padx=6)
+        ttk.Button(g1, text="Close GDO Plots", command=lambda: self._close_plots('gdo')).pack(side=tk.RIGHT, padx=6)
 
-        ttk.Label(controls, text="Max lag:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.ccf_max_lag_s, width=6).pack(side=tk.LEFT, padx=3)
-        ttk.Label(controls, text="s").pack(side=tk.LEFT)
+        g2 = ttk.Frame(tab_gdo); g2.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(g2, text="Plot Selected Groups", command=lambda: self.on_plot_group_decay(selected_only=True)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(g2, text="Plot All Groups", command=lambda: self.on_plot_group_decay(selected_only=False)).pack(side=tk.LEFT, padx=6)
+        ttk.Label(tab_gdo, text="Pick groups below (default: all).").pack(anchor="w", padx=10)
 
-        btns = ttk.Frame(tab); btns.pack(fill=tk.X, padx=6, pady=6)
-        ttk.Button(btns, text="Analyze Group", command=self.on_analyze_group).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="Scatter + Fit", command=self.on_scatter_fit).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="Export Aligned CSV…", command=self.on_export_aligned_csv).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="Save Figure…", command=self.on_save_last_figure).pack(side=tk.LEFT, padx=3)
+        frame_list = ttk.Frame(tab_gdo); frame_list.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.lb_groups_select = tk.Listbox(frame_list, selectmode=tk.EXTENDED, exportselection=False)
+        vs = ttk.Scrollbar(frame_list, orient="vertical", command=self.lb_groups_select.yview)
+        self.lb_groups_select.configure(yscroll=vs.set)
+        self.lb_groups_select.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        frame_list.rowconfigure(0, weight=1); frame_list.columnconfigure(0, weight=1)
+        bsel = ttk.Frame(tab_gdo); bsel.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Button(bsel, text="Select All", command=self._select_all_groups).pack(side=tk.LEFT, padx=3)
+        ttk.Button(bsel, text="Select None", command=lambda: self.lb_groups_select.selection_clear(0, tk.END)).pack(side=tk.LEFT, padx=3)
 
-        note = ttk.Label(tab, text="Alignment uses absolute epoch timestamps with nearest merge; power is resampled to 1 s means.")
-        note.pack(anchor="w", padx=6)
+    # ---- View helpers ----
+    def _set_initial_sashes(self):
+        try:
+            self.update_idletasks()
+            total = self._paned.winfo_width() or self.winfo_width()
+            self._paned.sashpos(0, int(total*0.7))
+        except Exception:
+            pass
 
-    def _build_tab_group_decay(self):
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="Group Decay Overlay")
+    def on_toggle_controls(self):
+        vis = self.controls_visible.get()
+        try:
+            if vis and self._controls not in self._paned.panes():
+                self._paned.add(self._controls, weight=3)
+            elif not vis and self._controls in self._paned.panes():
+                self._paned.forget(self._controls)
+        except Exception:
+            pass
 
-        controls = ttk.Frame(tab); controls.pack(fill=tk.X, padx=6, pady=6)
-        ttk.Label(controls, text="EMA span:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(controls, textvariable=self.overlay_ema_span, width=6).pack(side=tk.LEFT, padx=3)
-        ttk.Button(controls, text="Plot All Groups", command=self.on_plot_group_decay).pack(side=tk.LEFT, padx=6)
-        ttk.Button(controls, text="Save Figure…", command=self.on_save_last_figure).pack(side=tk.LEFT, padx=3)
+    def on_compact_controls_width(self):
+        try:
+            self.update_idletasks()
+            self._paned.sashpos(0, max(380, self._paned.winfo_width() - 360))
+        except Exception:
+            pass
 
-        note = ttk.Label(tab, text="Each group’s intensity is normalized to its own peak (100%). Per‑group offset is applied.")
-        note.pack(anchor="w", padx=6)
+    def on_maximize_files(self):
+        try:
+            self.update_idletasks()
+            self._paned.sashpos(0, self._paned.winfo_width() - 40)
+        except Exception:
+            pass
 
-    # -------------------------
-    # Files logic
-    # -------------------------
+    def on_maximize_groups(self):
+        try:
+            # Favor groups vertically in left column
+            for child in self._paned.winfo_children():
+                left = child; break
+            for ch in left.winfo_children():
+                if isinstance(ch, ttk.Panedwindow):
+                    h = ch.winfo_height() or left.winfo_height()
+                    ch.sashpos(0, int(h*0.55))
+                    break
+        except Exception:
+            pass
+
+    # ---- Files/Groups ----
     def on_add_sw3_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Add SW3/eegbin Files",
-            filetypes=[("SW3/eegbin", "*.sw3 *.eegbin *.bin *.*")])
-        if not paths:
-            return
+        paths = filedialog.askopenfilenames(title="Add SW3/eegbin Files",
+                                            filetypes=[("SW3/eegbin", "*.sw3 *.eegbin *.bin *.*")])
+        if not paths: return
         ensure_eegbin_imported()
-        added = 0
+        n=0
         for path in paths:
             try:
-                with open(path, "rb") as fd:
-                    buf = fd.read()
-                # Try v3 then v2
-                try:
-                    sweep = eegbin.load_eegbin3(buf, from_path=path)
-                except Exception:
-                    sweep = eegbin.load_eegbin2(buf, from_path=path)
+                with open(path, "rb") as fd: buf = fd.read()
+                try: sweep = eegbin.load_eegbin3(buf, from_path=path)
+                except Exception: sweep = eegbin.load_eegbin2(buf, from_path=path)
                 meta = self._meta_from_sweep(sweep)
-                file_id = self._next_file_id()
-                rec = FileRecord(file_id=file_id, kind="sw3", path=path,
-                                 label=os.path.basename(path), meta=meta)
-                self.files[file_id] = rec
-                added += 1
+                fid = self._next_file_id()
+                self.files[fid] = FileRecord(fid, "sw3", path, os.path.basename(path), meta)
+                n += 1
             except Exception as e:
-                traceback.print_exc()
-                messagebox.showwarning("Load error", f"Failed to load {path}\n{e}")
-        if added:
+                traceback.print_exc(); messagebox.showwarning("Load error", f"Failed to load {path}\n{e}")
+        if n:
             self._refresh_files_tv()
-            self._refresh_sw3_combobox()
-            self._set_status(f"Added {added} SW3 file(s).")
+            self._refresh_friendly_dropdowns()
+            self._set_status(f"Added {n} SW3 file(s).")
 
     def on_add_power_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Add Power CSV Files",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        if not paths:
-            return
-        added = 0
+        paths = filedialog.askopenfilenames(title="Add Power CSV Files",
+                                            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not paths: return
+        n=0
         for path in paths:
             try:
-                df, meta = self._load_power_csv_with_meta(path)
-                # We only keep meta here; CSV is re‑loaded on demand (memory‑friendly).
-                file_id = self._next_file_id()
-                rec = FileRecord(file_id=file_id, kind="power", path=path,
-                                 label=os.path.basename(path), meta=meta)
-                self.files[file_id] = rec
-                added += 1
+                _, meta = self._load_power_csv_with_meta(path)
+                fid = self._next_file_id()
+                self.files[fid] = FileRecord(fid, "power", path, os.path.basename(path), meta)
+                n+=1
             except Exception as e:
-                traceback.print_exc()
-                messagebox.showwarning("Load error", f"Failed to load {path}\n{e}")
-        if added:
+                traceback.print_exc(); messagebox.showwarning("Load error", f"Failed to load {path}\n{e}")
+        if n:
             self._refresh_files_tv()
-            self._set_status(f"Added {added} power file(s).")
+            self._refresh_friendly_dropdowns()
+            self._set_status(f"Added {n} power file(s).")
 
     def _meta_from_sweep(self, sweep) -> Dict[str, object]:
         rows = [r for r in sweep.rows if getattr(r, "timestamp", None) is not None]
         ts = [r.timestamp for r in rows]
         first = min(ts) if ts else None
         last = max(ts) if ts else None
-        return {
-            "first_ts": first,
-            "last_ts": last,
-            "count": len(rows),
-            "lamp_name": getattr(sweep, "lamp_name", ""),
-        }
+        return {"first_ts": first, "last_ts": last, "count": len(rows), "lamp_name": getattr(sweep, "lamp_name", "")}
 
     def _load_power_csv_with_meta(self, path: str) -> Tuple[pd.DataFrame, Dict[str, object]]:
         df = pd.read_csv(path)
         ts_col = self._detect_col(df.columns, self.power_column_map["timestamp"])
-        watt_col = self._detect_col(df.columns, self.power_column_map["watts"])
-        if not ts_col or not watt_col:
-            raise ValueError(
-                f"CSV must have a timestamp and watts column. Tried {self.power_column_map}. "
-                f"Columns found: {list(df.columns)}"
-            )
-        df = df[[ts_col, watt_col]].rename(columns={ts_col: "Timestamp", watt_col: "W_Active"})
-        # ensure numeric
+        w_col  = self._detect_col(df.columns, self.power_column_map["watts"])
+        if not ts_col or not w_col:
+            raise ValueError(f"CSV must include timestamp + watts. Candidates tried: {self.power_column_map}. Found: {list(df.columns)}")
+        df = df[[ts_col, w_col]].rename(columns={ts_col:"Timestamp", w_col:"W_Active"})
         df["Timestamp"] = pd.to_numeric(df["Timestamp"], errors="coerce")
-        df["W_Active"] = pd.to_numeric(df["W_Active"], errors="coerce")
-        df = df.dropna(subset=["Timestamp", "W_Active"])
-        meta = {
-            "first_ts": float(df["Timestamp"].min()) if not df.empty else None,
-            "last_ts": float(df["Timestamp"].max()) if not df.empty else None,
-            "count": int(len(df)),
-        }
+        df["W_Active"]  = pd.to_numeric(df["W_Active"], errors="coerce")
+        df = df.dropna(subset=["Timestamp","W_Active"])
+        meta = {"first_ts": float(df["Timestamp"].min()) if not df.empty else None,
+                "last_ts":  float(df["Timestamp"].max()) if not df.empty else None,
+                "count": int(len(df))}
         return df, meta
 
     def _detect_col(self, cols, candidates: List[str]) -> Optional[str]:
-        lower = {c.lower(): c for c in cols}
+        m = {c.lower(): c for c in cols}
         for cand in candidates:
-            if cand.lower() in lower:
-                return lower[cand.lower()]
+            if cand.lower() in m:
+                return m[cand.lower()]
         return None
 
     def _refresh_files_tv(self):
-        tv = self.tv_files
-        for item in tv.get_children():
-            tv.delete(item)
-        for file_id, rec in self.files.items():
+        self.tv_files.delete(*self.tv_files.get_children())
+        for fid, rec in self.files.items():
             first = human_datetime(rec.meta.get("first_ts")) if rec.meta.get("first_ts") else ""
             last  = human_datetime(rec.meta.get("last_ts")) if rec.meta.get("last_ts") else ""
-            count = rec.meta.get("count", "")
-            tv.insert("", "end", iid=file_id, values=(rec.label, rec.kind, first, last, count, rec.path))
+            count = rec.meta.get("count","")
+            self.tv_files.insert("", "end", iid=fid, values=(rec.label, rec.kind, first, last, count, rec.path))
 
-    def _refresh_sw3_combobox(self):
-        sw3_items = [(fid, fr) for fid, fr in self.files.items() if fr.kind == "sw3"]
-        self.cb_sw3["values"] = [fid for fid, _ in sw3_items]  # store id in values for simplicity
-        # Keep current selection if still valid
-        cur = self.selected_sw3_id.get()
-        if cur and cur in self.files and self.files[cur].kind == "sw3":
-            pass
-        elif sw3_items:
-            self.selected_sw3_id.set(sw3_items[0][0])
-        else:
-            self.selected_sw3_id.set("")
+    def _refresh_groups_tv(self):
+        self.tv_groups.delete(*self.tv_groups.get_children())
+        for gid, g in self.groups.items():
+            sw3c = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "sw3")
+            powc = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "power")
+            self.tv_groups.insert("", "end", iid=gid, values=(g.name, fmt_hhmmss(g.offset_s), sw3c, powc))
+        self._refresh_group_select_list()
+        self._refresh_friendly_dropdowns()
 
+    def _refresh_group_select_list(self):
+        self.lb_groups_select.delete(0, tk.END)
+        for gid, g in self.groups.items():
+            self.lb_groups_select.insert(tk.END, f"{gid}  {g.name}")
+
+    def _refresh_friendly_dropdowns(self):
+        # SW3 file dropdown (use labels; disambiguate if duplicates)
+        sw3_ids = [fid for fid, fr in self.files.items() if fr.kind=="sw3"]
+        labels = [self.files[fid].label for fid in sw3_ids]
+        counts = {}
+        for lab in labels: counts[lab] = counts.get(lab,0)+1
+        self._sw3_display_to_id.clear()
+        sw3_display = []
+        for fid in sw3_ids:
+            lab = self.files[fid].label
+            disp = lab if counts[lab]==1 else f"{lab} [{fid}]"
+            self._sw3_display_to_id[disp] = fid
+            sw3_display.append(disp)
+        self.cb_ivt_sw3["values"] = sw3_display
+
+        # Group dropdowns
+        self._group_display_to_id.clear()
+        group_display = []
+        name_counts = {}
+        for g in self.groups.values():
+            name_counts[g.name] = name_counts.get(g.name,0)+1
+        for gid, g in self.groups.items():
+            disp = g.name if name_counts[g.name]==1 else f"{g.name} [{gid}]"
+            self._group_display_to_id[disp] = gid
+            group_display.append(disp)
+        self.cb_ivt_group["values"] = group_display
+        self.cb_group["values"] = group_display
+
+    def _display_to_sw3_id(self, disp: str) -> Optional[str]:
+        return self._sw3_display_to_id.get(disp)
+
+    def _display_to_group_id(self, disp: str) -> Optional[str]:
+        return self._group_display_to_id.get(disp)
+
+    # ---- Actions ----
     def on_rename_file(self):
         sel = self.tv_files.selection()
-        if not sel:
-            return
+        if not sel: return
         if len(sel) > 1:
-            messagebox.showinfo("Rename", "Select a single file to rename.")
-            return
-        file_id = sel[0]
-        rec = self.files[file_id]
+            messagebox.showinfo("Rename", "Select a single file to rename."); return
+        fid = sel[0]
+        rec = self.files[fid]
         new = simpledialog.askstring("Rename", "New label:", initialvalue=rec.label, parent=self)
         if new:
             rec.label = new.strip()
             self._refresh_files_tv()
+            self._refresh_friendly_dropdowns()
 
     def on_remove_files(self):
         sel = list(self.tv_files.selection())
-        if not sel:
-            return
+        if not sel: return
         if not messagebox.askyesno("Remove", f"Remove {len(sel)} file(s) from the project?"):
             return
-        for file_id in sel:
-            # Remove from groups & associations
-            for gid, g in self.groups.items():
-                g.file_ids.discard(file_id)
-                if file_id in g.associations:
-                    del g.associations[file_id]
+        for fid in sel:
+            for g in self.groups.values():
+                g.file_ids.discard(fid)
+                g.associations.pop(fid, None)
                 for k in list(g.associations.keys()):
-                    if file_id in g.associations[k]:
-                        g.associations[k].discard(file_id)
-            self.files.pop(file_id, None)
+                    g.associations[k].discard(fid)
+                    if not g.associations[k]:
+                        g.associations.pop(k, None)
+            self.files.pop(fid, None)
         self._refresh_files_tv()
         self._refresh_groups_tv()
-        self._set_status("Removed selected files.")
 
     def on_assign_files_to_group(self):
-        sel_files = list(self.tv_files.selection())
-        if not sel_files:
-            messagebox.showinfo("Assign", "Select files (SW3 and/or Power) to assign to a group.")
-            return
+        sel = list(self.tv_files.selection())
+        if not sel:
+            messagebox.showinfo("Assign", "Select files (SW3 and/or Power) to assign to a group."); return
         gid = self._ensure_group_selected_or_prompt()
-        if not gid:
-            return
+        if not gid: return
         g = self.groups[gid]
-        for fid in sel_files:
-            g.file_ids.add(fid)
+        for fid in sel: g.file_ids.add(fid)
         self._refresh_groups_tv()
-        self._set_status(f"Assigned {len(sel_files)} files to group '{g.name}'.")
+        self._set_status(f"Assigned {len(sel)} file(s) to group '{g.name}'.")
 
-    # -------------------------
-    # Groups logic
-    # -------------------------
     def on_new_group(self):
         name = simpledialog.askstring("New Group", "Group name:", parent=self)
-        if not name:
-            return
+        if not name: return
         gid = self._next_group_id()
-        self.groups[gid] = GroupRecord(group_id=gid, name=name.strip())
+        self.groups[gid] = GroupRecord(gid, name.strip())
         self._refresh_groups_tv()
-        self._refresh_group_combobox()
         self._set_status(f"Created group '{name}'.")
 
     def on_rename_group(self):
         gid = self._ensure_group_selected_or_prompt()
-        if not gid:
-            return
+        if not gid: return
         g = self.groups[gid]
         new = simpledialog.askstring("Rename Group", "New name:", initialvalue=g.name, parent=self)
         if new:
             g.name = new.strip()
             self._refresh_groups_tv()
-            self._refresh_group_combobox()
 
     def on_delete_group(self):
         gid = self._ensure_group_selected_or_prompt()
-        if not gid:
-            return
-        g = self.groups[gid]
-        if not messagebox.askyesno("Delete Group", f"Delete group '{g.name}'? This does not delete files."):
+        if not gid: return
+        if not messagebox.askyesno("Delete Group", "Delete this group (files remain in project)?"):
             return
         del self.groups[gid]
         self._refresh_groups_tv()
-        self._refresh_group_combobox()
 
     def on_edit_associations(self):
         gid = self._ensure_group_selected_or_prompt()
-        if not gid:
-            return
+        if not gid: return
         g = self.groups[gid]
-
-        # Prepare lists
-        sw3s = [(fid, self.files[fid]) for fid in g.file_ids if self.files[fid].kind == "sw3"]
-        pows = [(fid, self.files[fid]) for fid in g.file_ids if self.files[fid].kind == "power"]
+        sw3s = [(fid, self.files[fid]) for fid in g.file_ids if self.files[fid].kind=="sw3"]
+        pows = [(fid, self.files[fid]) for fid in g.file_ids if self.files[fid].kind=="power"]
         if not sw3s or not pows:
-            messagebox.showinfo("Associations", "Assign at least one SW3 and one Power file to the group first.")
-            return
-
-        dlg = AssociationDialog(self, g, sw3s, pows)
-        self.wait_window(dlg)
-        if dlg.updated:
-            self._set_status("Updated associations.")
+            messagebox.showinfo("Associations", "Assign at least one SW3 and one Power file to the group first."); return
+        dlg = AssociationDialog(self, g, sw3s, pows); self.wait_window(dlg)
+        if dlg.updated: self._set_status("Updated associations.")
 
     def on_set_group_offset(self):
         gid = self._ensure_group_selected_or_prompt()
-        if not gid:
-            return
+        if not gid: return
         g = self.groups[gid]
         cur = fmt_hhmmss(g.offset_s)
         s = simpledialog.askstring("Set Offset", "Enter offset (HH:MM:SS, can be negative):", initialvalue=cur, parent=self)
-        if s is None:
-            return
-        try:
-            g.offset_s = parse_hhmmss(s)
-        except Exception as e:
-            messagebox.showwarning("Invalid", str(e))
-            return
+        if s is None: return
+        try: g.offset_s = parse_hhmmss(s)
+        except Exception as e: messagebox.showwarning("Invalid", str(e)); return
         self._refresh_groups_tv()
 
     def on_clear_group_offset(self):
         gid = self._ensure_group_selected_or_prompt()
-        if not gid:
-            return
-        self.groups[gid].offset_s = 0
-        self._refresh_groups_tv()
+        if not gid: return
+        self.groups[gid].offset_s = 0; self._refresh_groups_tv()
 
     def _ensure_group_selected_or_prompt(self) -> Optional[str]:
         sel = self.tv_groups.selection()
-        if sel:
-            return sel[0]
-        # prompt user to choose
+        if sel: return sel[0]
         if not self.groups:
-            messagebox.showinfo("Groups", "Create a group first.")
-            return None
-        choices = list(self.groups.keys())
-        labels = [self.groups[c].name for c in choices]
-        idx = simpledialog.askinteger("Select Group", "Enter group number:\n" + "\n".join(f"{i+1}. {labels[i]}" for i in range(len(labels))),
+            messagebox.showinfo("Groups", "Create a group first."); return None
+        choices = list(self.groups.keys()); labels = [self.groups[c].name for c in choices]
+        idx = simpledialog.askinteger("Select Group", "Enter group number:\n"+ "\n".join(f"{i+1}. {labels[i]}" for i in range(len(labels))),
                                       minvalue=1, maxvalue=len(labels), parent=self)
-        if idx is None:
-            return None
-        return choices[idx-1]
+        return choices[idx-1] if idx else None
 
     def _on_group_selection_changed(self):
-        sel = self.tv_groups.selection()
-        if sel:
-            gid = sel[0]
-            self.selected_group_id.set(gid)
+        pass
 
-    def _refresh_groups_tv(self):
-        tv = self.tv_groups
-        for item in tv.get_children():
-            tv.delete(item)
-        for gid, g in self.groups.items():
-            sw3_count = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "sw3")
-            pow_count = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "power")
-            tv.insert("", "end", iid=gid, values=(g.name, fmt_hhmmss(g.offset_s), sw3_count, pow_count))
+    # ---- Settings ----
+    def on_set_power_columns(self):
+        top = tk.Toplevel(self); top.title("Power Columns Map"); top.resizable(True, False)
+        ttk.Label(top, text="Candidate names for timestamp column (comma‑separated):").pack(anchor="w", padx=6, pady=(6,0))
+        e1 = ttk.Entry(top, width=60); e1.insert(0, ", ".join(self.power_column_map["timestamp"])); e1.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(top, text="Candidate names for watts column (comma‑separated):").pack(anchor="w", padx=6, pady=(6,0))
+        e2 = ttk.Entry(top, width=60); e2.insert(0, ", ".join(self.power_column_map["watts"])); e2.pack(fill=tk.X, padx=6, pady=3)
+        def save():
+            self.power_column_map["timestamp"] = [s.strip() for s in e1.get().split(",") if s.strip()]
+            self.power_column_map["watts"] = [s.strip() for s in e2.get().split(",") if s.strip()]
+            top.destroy()
+        b = ttk.Frame(top); b.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(b, text="OK", command=save).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(b, text="Cancel", command=top.destroy).pack(side=tk.RIGHT, padx=3)
 
-    def _refresh_group_combobox(self):
-        items = [(gid, gr) for gid, gr in self.groups.items()]
-        self.cb_group["values"] = [gid for gid, _ in items]
-        if items and not self.selected_group_id.get():
-            self.selected_group_id.set(items[0][0])
+    def on_add_module_path(self):
+        folder = filedialog.askdirectory(title="Add folder to Python module search path (eegbin/util)")
+        if not folder: return
+        _add_module_path(folder); self._set_status(f"Added module path: {folder}")
 
-    # -------------------------
-    # Project save/load
-    # -------------------------
-    def on_save_project(self):
-        path = filedialog.asksaveasfilename(
-            title="Save Project", defaultextension=".json",
-            filetypes=[("Project JSON", "*.json")])
-        if not path:
-            return
+    def on_list_module_paths(self):
+        if not _EXTRA_MODULE_PATHS:
+            messagebox.showinfo("Module Paths", "No extra module paths added."); return
+        msg = "Extra module search paths:\n\n" + "\n".join("• "+p for p in _EXTRA_MODULE_PATHS)
+        messagebox.showinfo("Module Paths", msg)
+
+    # ---- Reload ----
+    def on_reload_all_files(self, only_selected: bool=False):
+        targets = list(self.tv_files.selection()) if only_selected else list(self.files.keys())
+        if only_selected and not targets:
+            messagebox.showinfo("Reload", "No files selected."); return
+        ensure_eegbin_imported()
+        ok=err=0
+        for fid in targets:
+            rec = self.files.get(fid)
+            if not rec: continue
+            try:
+                if rec.kind=="sw3":
+                    with open(rec.path, "rb") as fd: buf = fd.read()
+                    try: sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
+                    except Exception: sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
+                    rec.meta = self._meta_from_sweep(sweep)
+                else:
+                    _, rec.meta = self._load_power_csv_with_meta(rec.path)
+                ok += 1
+            except Exception:
+                err += 1
+        self._refresh_files_tv(); self._refresh_groups_tv(); self._refresh_friendly_dropdowns()
+        self._set_status(f"Reloaded {ok} file(s){'; errors: '+str(err) if err else ''}.")
+
+    # ---- Session I/O ----
+    def on_save_session(self):
+        path = filedialog.asksaveasfilename(title="Save Session", defaultextension=".json",
+                                            filetypes=[("Session JSON","*.json")])
+        if not path: return
         data = {
             "power_column_map": self.power_column_map,
             "module_paths": list(_EXTRA_MODULE_PATHS),
             "files": [asdict(fr) for fr in self.files.values()],
-            "groups": [
-                {
-                    "group_id": g.group_id,
-                    "name": g.name,
-                    "offset_s": g.offset_s,
-                    "file_ids": list(g.file_ids),
-                    "associations": {k: list(v) for k, v in g.associations.items()},
-                } for g in self.groups.values()
-            ],
+            "groups": [{
+                "group_id": g.group_id, "name": g.name, "offset_s": g.offset_s,
+                "file_ids": list(g.file_ids),
+                "associations": {k: list(v) for k,v in g.associations.items()},
+            } for g in self.groups.values()],
+            "controls": {
+                "intensity_ema_span": self.intensity_ema_span.get(),
+                "power_ema_span": self.power_ema_span.get(),
+                "overlay_ema_span": self.overlay_ema_span.get(),
+                "trim_start_s": self.trim_start_s.get(),
+                "trim_end_s": self.trim_end_s.get(),
+                "align_tolerance_s": self.align_tolerance_s.get(),
+                "ccf_max_lag_s": self.ccf_max_lag_s.get(),
+                "resample_seconds": self.resample_seconds.get(),
+                "normalize_to_1m": self.normalize_to_1m.get(),
+                "only_yaw_roll_zero": self.only_yaw_roll_zero.get(),
+                "ivt_show_points": self.ivt_show_points.get(),
+                "ivt_show_ema": self.ivt_show_ema.get(),
+                "ivt_point_alpha": float(self.ivt_point_alpha.get()),
+                "ivt_line_alpha": float(self.ivt_line_alpha.get()),
+                "ovp_show_points": self.ovp_show_points.get(),
+                "ovp_show_int_ema": self.ovp_show_int_ema.get(),
+                "ovp_show_pow_ema": self.ovp_show_pow_ema.get(),
+                "ovp_point_alpha": float(self.ovp_point_alpha.get()),
+                "ovp_line_alpha": float(self.ovp_line_alpha.get()),
+                "gdo_show_points": self.gdo_show_points.get(),
+                "gdo_show_ema": self.gdo_show_ema.get(),
+                "gdo_point_alpha": float(self.gdo_point_alpha.get()),
+                "gdo_line_alpha": float(self.gdo_line_alpha.get()),
+                "source_mode": self.source_mode.get(),
+                "combine_group_sw3": self.combine_group_sw3.get(),
+                "ivt_sw3_display": self.ivt_sw3_display.get(),
+                "ivt_group_display": self.ivt_group_display.get(),
+                "ovp_group_display": self.ovp_group_display.get(),
+                "controls_visible": self.controls_visible.get(),
+            }
         }
-        with open(path, "w") as fd:
-            json.dump(data, fd, indent=2)
-        self._set_status(f"Saved project to {path}")
+        with open(path, "w") as fd: json.dump(data, fd, indent=2)
+        self._set_status(f"Saved session to {path}")
 
-    def on_load_project(self):
-        path = filedialog.askopenfilename(
-            title="Load Project", filetypes=[("Project JSON", "*.json"), ("All files", "*.*")])
-        if not path:
-            return
-        with open(path, "r") as fd:
-            data = json.load(fd)
-        self.power_column_map = data.get("power_column_map", self.power_column_map)
-        # restore module paths
+    def on_load_session(self):
+        path = filedialog.askopenfilename(title="Load Session",
+                                          filetypes=[("Session JSON","*.json"),("All files","*.*")])
+        if not path: return
+        with open(path, "r") as fd: data = json.load(fd)
         _EXTRA_MODULE_PATHS.clear()
-        for p in data.get("module_paths", []):
-            _add_module_path(p)
-
+        for p in data.get("module_paths", []): _add_module_path(p)
+        self.power_column_map = data.get("power_column_map", self.power_column_map)
         self.files = {fr["file_id"]: FileRecord(**fr) for fr in data.get("files", [])}
         self.groups = {}
         for g in data.get("groups", []):
-            gr = GroupRecord(group_id=g["group_id"], name=g["name"], offset_s=g.get("offset_s", 0))
+            gr = GroupRecord(group_id=g["group_id"], name=g["name"], offset_s=g.get("offset_s",0))
             gr.file_ids = set(g.get("file_ids", []))
-            gr.associations = {k: set(v) for k, v in g.get("associations", {}).items()}
+            gr.associations = {k: set(v) for k,v in g.get("associations", {}).items()}
             self.groups[gr.group_id] = gr
+        c = data.get("controls", {})
+        def set_if(k,var): 
+            if k in c: var.set(c[k])
+        for k,var in [
+            ("intensity_ema_span", self.intensity_ema_span),
+            ("power_ema_span", self.power_ema_span),
+            ("overlay_ema_span", self.overlay_ema_span),
+            ("trim_start_s", self.trim_start_s),
+            ("trim_end_s", self.trim_end_s),
+            ("align_tolerance_s", self.align_tolerance_s),
+            ("ccf_max_lag_s", self.ccf_max_lag_s),
+            ("resample_seconds", self.resample_seconds),
+            ("normalize_to_1m", self.normalize_to_1m),
+            ("only_yaw_roll_zero", self.only_yaw_roll_zero),
+            ("ivt_show_points", self.ivt_show_points),
+            ("ivt_show_ema", self.ivt_show_ema),
+            ("ivt_point_alpha", self.ivt_point_alpha),
+            ("ivt_line_alpha", self.ivt_line_alpha),
+            ("ovp_show_points", self.ovp_show_points),
+            ("ovp_show_int_ema", self.ovp_show_int_ema),
+            ("ovp_show_pow_ema", self.ovp_show_pow_ema),
+            ("ovp_point_alpha", self.ovp_point_alpha),
+            ("ovp_line_alpha", self.ovp_line_alpha),
+            ("gdo_show_points", self.gdo_show_points),
+            ("gdo_show_ema", self.gdo_show_ema),
+            ("gdo_point_alpha", self.gdo_point_alpha),
+            ("gdo_line_alpha", self.gdo_line_alpha),
+            ("source_mode", self.source_mode),
+            ("combine_group_sw3", self.combine_group_sw3),
+            ("ivt_sw3_display", self.ivt_sw3_display),
+            ("ivt_group_display", self.ivt_group_display),
+            ("ovp_group_display", self.ovp_group_display),
+            ("controls_visible", self.controls_visible),
+        ]: set_if(k,var)
+
         self._refresh_files_tv()
         self._refresh_groups_tv()
-        self._refresh_group_combobox()
-        self._refresh_sw3_combobox()
-        self._set_status(f"Loaded project from {path}")
+        self._refresh_friendly_dropdowns()
+        self.on_toggle_controls()
+        self._set_status(f"Loaded session from {path}")
 
-    def on_set_power_columns(self):
-        top = tk.Toplevel(self); top.title("Power Columns Map")
-        top.resizable(True, False)
-        ttk.Label(top, text="Candidate names for timestamp column (comma‑separated):").pack(anchor="w", padx=6, pady=(6,0))
-        ts_entry = ttk.Entry(top, width=60)
-        ts_entry.insert(0, ", ".join(self.power_column_map["timestamp"]))
-        ts_entry.pack(fill=tk.X, padx=6, pady=3)
-
-        ttk.Label(top, text="Candidate names for watts column (comma‑separated):").pack(anchor="w", padx=6, pady=(6,0))
-        w_entry = ttk.Entry(top, width=60)
-        w_entry.insert(0, ", ".join(self.power_column_map["watts"]))
-        w_entry.pack(fill=tk.X, padx=6, pady=3)
-
-        btns = ttk.Frame(top); btns.pack(fill=tk.X, padx=6, pady=6)
-        def save():
-            self.power_column_map["timestamp"] = [s.strip() for s in ts_entry.get().split(",") if s.strip()]
-            self.power_column_map["watts"] = [s.strip() for s in w_entry.get().split(",") if s.strip()]
-            top.destroy()
-        ttk.Button(btns, text="OK", command=save).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(btns, text="Cancel", command=top.destroy).pack(side=tk.RIGHT, padx=3)
-
-    def on_add_module_path(self):
-        folder = filedialog.askdirectory(title="Add folder to Python module search path (eegbin/util)")
-        if not folder:
-            return
-        _add_module_path(folder)
-        self._set_status(f"Added module path: {folder}")
-
-    def on_list_module_paths(self):
-        if not _EXTRA_MODULE_PATHS:
-            messagebox.showinfo("Module Paths", "No extra module paths added.")
-            return
-        msg = "Extra module search paths (prepended to sys.path):\n\n"
-        for p in _EXTRA_MODULE_PATHS:
-            msg += f"• {p}\n"
-        messagebox.showinfo("Module Paths", msg)
-
-    # -------------------------
-    # Reload logic
-    # -------------------------
-    def on_reload_all_files(self, only_selected: bool=False):
-        """Reload file metadata (and schema inference) from disk.
-        Useful when files are appended/updated during ongoing runs.
-        """
-        targets = []
-        if only_selected:
-            targets = list(self.tv_files.selection())
-            if not targets:
-                messagebox.showinfo("Reload", "No files selected.")
-                return
-        else:
-            targets = list(self.files.keys())
-
-        ensure_eegbin_imported()
-        ok = 0
-        err = 0
-        for fid in targets:
-            rec = self.files.get(fid)
-            if not rec:
-                continue
-            try:
-                if rec.kind == "sw3":
-                    with open(rec.path, "rb") as fd:
-                        buf = fd.read()
-                    try:
-                        sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
-                    except Exception:
-                        sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
-                    rec.meta = self._meta_from_sweep(sweep)
-                elif rec.kind == "power":
-                    _, meta = self._load_power_csv_with_meta(rec.path)
-                    rec.meta = meta
-                ok += 1
-            except Exception as e:
-                err += 1
-                traceback.print_exc()
-        self._refresh_files_tv()
-        self._refresh_sw3_combobox()
-        self._set_status(f"Reloaded {ok} file(s){'; errors: '+str(err) if err else ''}.")
-
-    # -------------------------
-    # Analysis: Intensity vs Time
-    # -------------------------
+    # ---- Analysis: IVT ----
     def on_plot_intensity_vs_time(self):
-        fid = self.selected_sw3_id.get() or (self.tv_files.selection()[0] if self.tv_files.selection() else None)
-        if not fid or fid not in self.files or self.files[fid].kind != "sw3":
-            messagebox.showinfo("Plot", "Choose an SW3 file (via the dropdown or select in the Files list).")
-            return
-        rec = self.files[fid]
-        try:
-            with open(rec.path, "rb") as fd:
-                buf = fd.read()
-            ensure_eegbin_imported()
-            try:
-                sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
-            except Exception:
-                sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
-        except Exception as e:
-            messagebox.showwarning("Load error", f"Failed to load {rec.path}\n{e}")
-            return
+        # Close any old IVT plots to avoid clutter
+        self._close_plots('ivt')
 
-        only_zero = self.only_yaw_roll_zero.get()
-        normalize = self.normalize_to_1m.get()
         ema_span = int(self.intensity_ema_span.get())
         trim_start = int(self.trim_start_s.get())
-        trim_end = int(self.trim_end_s.get())
+        trim_end   = int(self.trim_end_s.get())
+        only_zero  = self.only_yaw_roll_zero.get()
+        norm_1m    = self.normalize_to_1m.get()
+        p_alpha    = float(self.ivt_point_alpha.get())
+        l_alpha    = float(self.ivt_line_alpha.get())
+        show_pts   = self.ivt_show_points.get()
+        show_line  = self.ivt_show_ema.get()
 
-        # Extract rows
-        rows = []
-        for r in sweep.rows:
-            if hasattr(r, "valid") and not r.valid:
-                continue
-            if only_zero and not (getattr(r.coords, "yaw_deg", None) == 0 and getattr(r.coords, "roll_deg", None) == 0):
-                continue
-            if getattr(r, "timestamp", None) is None:
-                continue
-            # intensity (W/m^2) at measured distance -> normalize to 1 m if requested
-            I_wm2 = float(getattr(r.capture, "integral_result", 0.0) or 0.0)
-            if normalize:
-                dist_m = float(getattr(r.coords, "lin_mm", 0.0) or 0.0) / 1000.0
-                if dist_m > 0:
-                    I_wm2 = I_wm2 * (dist_m**2)
-            # Convert to µW/cm^2
-            I_uW_cm2 = I_wm2 * 100.0
-            rows.append( (float(r.timestamp), I_uW_cm2) )
+        def rows_from_sw3(fid: str, offset_s: int = 0):
+            rec = self.files.get(fid)
+            if not rec or rec.kind != "sw3": return []
+            try:
+                with open(rec.path, "rb") as fd: buf = fd.read()
+                ensure_eegbin_imported()
+                try: sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
+                except Exception: sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
+            except Exception as e:
+                messagebox.showwarning("Load error", f"Failed to load {rec.path}\n{e}"); return []
+            out = []
+            for r in sweep.rows:
+                if hasattr(r, "valid") and not r.valid: continue
+                if only_zero and not (getattr(r.coords,"yaw_deg",None)==0 and getattr(r.coords,"roll_deg",None)==0): continue
+                if getattr(r, "timestamp", None) is None: continue
+                I_wm2 = float(getattr(r.capture, "integral_result", 0.0) or 0.0)
+                if norm_1m:
+                    dist_m = float(getattr(r.coords,"lin_mm",0.0) or 0.0)/1000.0
+                    if dist_m > 0: I_wm2 = I_wm2*(dist_m**2)
+                I_uW_cm2 = I_wm2*100.0
+                out.append((float(r.timestamp)+offset_s, I_uW_cm2))
+            out.sort(key=lambda x: x[0])
+            return out
 
-        if not rows:
-            messagebox.showinfo("Plot", "No rows available after filtering.")
-            return
+        fig = plt.figure(); ax = fig.add_subplot(111)
 
-        rows.sort(key=lambda x: x[0])
-        t = np.array([r[0] for r in rows], dtype=float)
-        y = np.array([r[1] for r in rows], dtype=float)
+        if self.source_mode.get() == "file":
+            disp = self.ivt_sw3_display.get()
+            fid = self._display_to_sw3_id(disp)
+            if not fid:
+                messagebox.showinfo("Plot", "Select an SW3 file (friendly name)."); return
+            g_offset = 0
+            for g in self.groups.values():
+                if fid in g.file_ids: g_offset = g.offset_s; break
+            rows = rows_from_sw3(fid, g_offset)
+            if not rows: messagebox.showinfo("Plot", "No rows after filtering."); return
+            t = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows])
+            t0 = t[0]
+            if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
+            if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
+            if t.size==0: messagebox.showinfo("Plot", "No data after trim."); return
+            y_ema = ema(y, ema_span)
+            th = (t - t[0]) / 3600.0
+            if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{self.files[fid].label} (raw)")
+            if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA (span={ema_span})")
+        else:
+            gdisp = self.ivt_group_display.get()
+            gid = self._display_to_group_id(gdisp)
+            if not gid or gid not in self.groups: messagebox.showinfo("Plot", "Select a Group (friendly name)."); return
+            g = self.groups[gid]
+            sw3_ids = [fid for fid in g.file_ids if self.files.get(fid) and self.files[fid].kind=="sw3"]
+            if not sw3_ids: messagebox.showinfo("Plot", "No SW3 files in this group."); return
+            colors = get_cmap_colors(len(sw3_ids), "viridis")
+            if self.combine_group_sw3.get():
+                all_rows = []
+                for fid in sw3_ids: all_rows.extend(rows_from_sw3(fid, g.offset_s))
+                if not all_rows: messagebox.showinfo("Plot", "No rows after filtering."); return
+                all_rows.sort(key=lambda x: x[0])
+                t = np.array([r[0] for r in all_rows]); y = np.array([r[1] for r in all_rows])
+                t0 = t[0]
+                if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
+                if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
+                if t.size==0: messagebox.showinfo("Plot", "No data after trim."); return
+                y_ema = ema(y, ema_span)
+                th = (t - t[0]) / 3600.0
+                if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{g.name} (raw)")
+                if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{g.name} EMA (span={ema_span})")
+            else:
+                for i, fid in enumerate(sw3_ids):
+                    rows = rows_from_sw3(fid, g.offset_s)
+                    if not rows: continue
+                    t = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows])
+                    t0 = t[0]
+                    if trim_start>0: mask = (t - t0) >= trim_start; t,y = t[mask], y[mask]
+                    if trim_end>0:   tend = t[-1]; mask = (tend - t) >= trim_end; t,y = t[mask], y[mask]
+                    if t.size==0: continue
+                    y_ema = ema(y, ema_span)
+                    th = (t - t[0]) / 3600.0
+                    c = colors[i]
+                    if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{self.files[fid].label} (raw)", color=c)
+                    if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA", color=c)
 
-        # Apply trim
-        t0 = t[0]
-        if trim_start > 0:
-            mask = (t - t0) >= trim_start
-            t, y = t[mask], y[mask]
-        if trim_end > 0:
-            t_end = t[-1]
-            mask = (t_end - t) >= trim_end
-            t, y = t[mask], y[mask]
-
-        if len(y) == 0:
-            messagebox.showinfo("Plot", "No data after trim.")
-            return
-
-        y_ema = ema_series(y, ema_span)
-
-        # Build time axes
-        t_hours = (t - t[0]) / 3600.0
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        ax.scatter(t_hours, y, s=8, alpha=0.15, label="Measured (Yaw=0, Roll=0)")
-        ax.plot(t_hours, y_ema, linewidth=2, label=f"EMA (span={ema_span})")
         ax.set_title("Measured Light Intensity vs Time")
-        ax.set_xlabel("Time Since Start (hours)")
+        ax.set_xlabel("Time since start (hours)")
         ax.set_ylabel("Normalized Intensity at 1 m (µW/cm²)")
-
-        # Some padding
-        if len(y) > 1:
-            pad = (max(y)-min(y))*0.05
-            ax.set_ylim(min(y)-pad, max(y)+pad)
-
-        ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.7)
+        ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend()
-
-        # Secondary x axis (absolute)
-        try:
-            import matplotlib.dates as mdates
-            t0_num = mdates.epoch2num(float(t[0]))
-            def hours_to_mpldate(x):
-                arr = np.asarray(x, dtype=float)
-                out = t0_num + arr / 24.0
-                return out.item() if np.isscalar(x) else out
-            secax = ax.secondary_xaxis("top", functions=(hours_to_mpldate, lambda x: (x - t0_num)*24.0))
-            secax.set_xlabel("Absolute Date/Time")
-            secax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
-            fig.autofmt_xdate(rotation=45)
-        except Exception:
-            pass
-
         fig.tight_layout()
-        self._last_fig = fig
+        self._register_fig('ivt', fig)
         plt.show(block=False)
-        self._set_status(f"Plotted intensity vs time for {rec.label}")
 
-    # -------------------------
-    # Analysis: Optics vs Power
-    # -------------------------
-    def on_analyze_group(self):
-        gid = self.selected_group_id.get()
-        if not gid or gid not in self.groups:
-            messagebox.showinfo("Analyze", "Select a Group.")
-            return
-        g = self.groups[gid]
-        # Collect associations
-        if not g.associations:
-            messagebox.showinfo("Analyze", "Set associations (SW3 → Power) for this group first.")
-            return
-
+    # ---- Analysis: OVP ----
+    def _build_aligned_for_group(self, gid: str) -> Optional[pd.DataFrame]:
+        g = self.groups.get(gid)
+        if not g or not g.associations:
+            return None
         ema_int = int(self.intensity_ema_span.get())
         ema_pow = int(self.power_ema_span.get())
-        tol_s = int(self.align_tolerance_s.get())
-        max_lag = int(self.ccf_max_lag_s.get())
-        normalize = self.normalize_to_1m.get()
+        tol_s   = int(self.align_tolerance_s.get())
         only_zero = self.only_yaw_roll_zero.get()
+        norm_1m   = self.normalize_to_1m.get()
 
-        # For each associated pair, produce aligned frame; then concatenate
-        aligned_frames = []
+        frames = []
         for sw3_id, pow_ids in g.associations.items():
             sw3_rec = self.files.get(sw3_id)
-            if not sw3_rec or sw3_rec.kind != "sw3":
+            if not sw3_rec or sw3_rec.kind!="sw3":
                 continue
-            # load SW3 rows
             try:
-                with open(sw3_rec.path, "rb") as fd:
-                    buf = fd.read()
+                with open(sw3_rec.path, "rb") as fd: buf = fd.read()
                 ensure_eegbin_imported()
-                try:
-                    sweep = eegbin.load_eegbin3(buf, from_path=sw3_rec.path)
-                except Exception:
-                    sweep = eegbin.load_eegbin2(buf, from_path=sw3_rec.path)
+                try: sweep = eegbin.load_eegbin3(buf, from_path=sw3_rec.path)
+                except Exception: sweep = eegbin.load_eegbin2(buf, from_path=sw3_rec.path)
             except Exception as e:
-                messagebox.showwarning("Load error", f"Failed to load {sw3_rec.path}\n{e}")
-                continue
+                messagebox.showwarning("Load error", f"Failed to load {sw3_rec.path}\n{e}"); continue
 
             sw_rows = []
             for r in sweep.rows:
-                if hasattr(r, "valid") and not r.valid:
-                    continue
-                if only_zero and not (getattr(r.coords, "yaw_deg", None) == 0 and getattr(r.coords, "roll_deg", None) == 0):
-                    continue
-                if getattr(r, "timestamp", None) is None:
-                    continue
+                if hasattr(r, "valid") and not r.valid: continue
+                if only_zero and not (getattr(r.coords,"yaw_deg",None)==0 and getattr(r.coords,"roll_deg",None)==0): continue
+                if getattr(r, "timestamp", None) is None: continue
                 I_wm2 = float(getattr(r.capture, "integral_result", 0.0) or 0.0)
-                if normalize:
-                    dist_m = float(getattr(r.coords, "lin_mm", 0.0) or 0.0) / 1000.0
-                    if dist_m > 0:
-                        I_wm2 = I_wm2 * (dist_m**2)
-                I_uW_cm2 = I_wm2 * 100.0
-                sw_rows.append( (float(r.timestamp) + g.offset_s, I_uW_cm2) )  # apply group offset
-
-            if not sw_rows:
-                continue
-            sw_rows.sort(key=lambda x: x[0])
+                if norm_1m:
+                    dist_m = float(getattr(r.coords,"lin_mm",0.0) or 0.0)/1000.0
+                    if dist_m>0: I_wm2 = I_wm2*(dist_m**2)
+                I_uW_cm2 = I_wm2*100.0
+                sw_rows.append((float(r.timestamp)+g.offset_s, I_uW_cm2))
+            if not sw_rows: continue
+            sw_rows.sort(key=lambda x:x[0])
             t_sw = np.array([r[0] for r in sw_rows], dtype=float)
             y_sw = np.array([r[1] for r in sw_rows], dtype=float)
-            y_sw_ema = ema_series(y_sw, ema_int)
-            df_sw = pd.DataFrame({"timestamp": t_sw, "intensity_ema": y_sw_ema})
+            df_sw = pd.DataFrame({"timestamp": t_sw, "intensity_ema": ema(y_sw, ema_int)})
 
-            # For each power file associated
             for pid in pow_ids:
-                pow_rec = self.files.get(pid)
-                if not pow_rec or pow_rec.kind != "power":
-                    continue
+                pow_rec = self.files.get(pid); 
+                if not pow_rec or pow_rec.kind!="power": continue
                 try:
                     power_df, _ = self._load_power_csv_with_meta(pow_rec.path)
                 except Exception as e:
-                    messagebox.showwarning("Load error", f"Failed to load CSV {pow_rec.path}\n{e}")
-                    continue
-                # Resample to 1 s mean, compute EMA
-                pdf = power_df.copy()
-                pdf["timestamp"] = pd.to_datetime(pdf["Timestamp"], unit='s')
+                    messagebox.showwarning("Load error", f"Failed to load CSV {pow_rec.path}\n{e}"); continue
+                # clip to SW3 window ± tol
+                tmin = t_sw.min() - tol_s; tmax = t_sw.max() + tol_s
+                pdf = power_df[(power_df["Timestamp"]>=tmin) & (power_df["Timestamp"]<=tmax)]
+                if pdf.empty: continue
+                pdf["timestamp"] = pd.to_datetime(pdf["Timestamp"], unit="s")
                 pdf = pdf.set_index("timestamp").sort_index()
                 pdf = pdf.resample(f"{self.resample_seconds.get()}S")["W_Active"].mean().to_frame("power")
                 pdf["power_ema"] = pdf["power"].ewm(span=ema_pow, adjust=False).mean()
-                pdf = pdf.dropna(subset=["power_ema"])
-                pdf = pdf.reset_index()
-                pdf["timestamp"] = pdf["timestamp"].astype('int64') // 10**9  # epoch seconds
+                pdf = pdf.dropna(subset=["power_ema"]).reset_index()
+                pdf["timestamp"] = pdf["timestamp"].astype("int64") // 10**9
 
-                # Align
-                df_join = merge_asof_seconds(df_sw, pdf[["timestamp", "power_ema"]].rename(columns={"power_ema": "power_ema"}), tol_s)
-                df_join = df_join.dropna(subset=["power_ema"])
+                df_join = merge_asof_seconds(df_sw, pdf[["timestamp","power_ema"]], tol_s).dropna(subset=["power_ema"])
+                if df_join.empty: continue
                 df_join["group_id"] = gid
                 df_join["sw3_id"] = sw3_id
                 df_join["power_id"] = pid
-                aligned_frames.append(df_join)
+                df_join["sw3_label"] = sw3_rec.label
+                df_join["power_label"] = pow_rec.label
+                frames.append(df_join)
 
-        if not aligned_frames:
-            messagebox.showinfo("Analyze", "No aligned data could be formed. Check associations and timestamps.")
-            return
+        if not frames:
+            return None
+        aligned = pd.concat(frames, ignore_index=True).sort_values("timestamp_s")
+        return aligned
 
-        aligned = pd.concat(aligned_frames, ignore_index=True).sort_values("timestamp_s")
-        if aligned.empty:
-            messagebox.showinfo("Analyze", "Aligned data is empty.")
-            return
+    def on_analyze_group(self):
+        # Close old OVP plots
+        self._close_plots('ovp')
 
-        # Compute correlation & cross‑correlation on EMA series
-        x = aligned["intensity_ema"].to_numpy(dtype=float)
-        y = aligned["power_ema"].to_numpy(dtype=float)
-        r = np.corrcoef(x, y)[0, 1] if np.std(x)>0 and np.std(y)>0 else float("nan")
+        gdisp = self.ovp_group_display.get()
+        gid = self._display_to_group_id(gdisp)
+        if not gid or gid not in self.groups:
+            messagebox.showinfo("Analyze", "Select a Group (friendly name)."); return
+        aligned = self._build_aligned_for_group(gid)
+        if aligned is None or aligned.empty:
+            messagebox.showinfo("Analyze", "No aligned data could be formed."); return
+        self._aligned_cache = aligned
 
-        # Cross‑correlation scan (intensity relative to power): lag in seconds
-        lags = np.arange(-int(self.ccf_max_lag_s.get()), int(self.ccf_max_lag_s.get())+1, 1, dtype=int)
-        ccf_vals = []
-        for lag in lags:
-            if lag < 0:
-                x_lag = x[-lag:]
-                y_lag = y[:len(x_lag)]
-            elif lag > 0:
-                y_lag = y[lag:]
-                x_lag = x[:len(y_lag)]
-            else:
-                x_lag = x
-                y_lag = y
-            if len(x_lag) == 0 or len(y_lag) == 0 or np.std(x_lag)==0 or np.std(y_lag)==0:
-                ccf_vals.append(np.nan)
-            else:
-                ccf_vals.append(np.corrcoef(x_lag, y_lag)[0,1])
-        ccf_vals = np.array(ccf_vals, dtype=float)
-        best_idx = int(np.nanargmax(np.abs(ccf_vals))) if np.isfinite(ccf_vals).any() else None
-        best_lag = lags[best_idx] if best_idx is not None else None
-        best_ccf = ccf_vals[best_idx] if best_idx is not None else float("nan")
+        show_pts = self.ovp_show_points.get()
+        show_int = self.ovp_show_int_ema.get()
+        show_pow = self.ovp_show_pow_ema.get()
+        p_alpha  = float(self.ovp_point_alpha.get())
+        l_alpha  = float(self.ovp_line_alpha.get())
 
-        # ---------------- Plots ----------------
-        # 1) Time series (dual axis)
-        fig_ts = plt.figure()
-        ax1 = fig_ts.add_subplot(111)
+        # Unique pairs by IDs; consistent colors
+        pair_ids = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
+        base_colors = get_cmap_colors(len(pair_ids), "viridis")
+        fig = plt.figure()
+        ax1 = fig.add_subplot(111)
         ax2 = ax1.twinx()
-        t0 = aligned["timestamp_s"].min()
-        t_hours = (aligned["timestamp_s"] - t0) / 3600.0
-        ax1.plot(t_hours, aligned["intensity_ema"], label="Intensity (EMA)")
-        ax2.plot(t_hours, aligned["power_ema"], label="Power (EMA)")
-        ax1.set_xlabel("Time since start (hours)")
+
+        # common reference: earliest pair start for nicer side-by-side comparison
+        t0_global = aligned["timestamp_s"].min()
+
+        for i, (sid, pid) in enumerate(pair_ids):
+            dfp = aligned[(aligned["sw3_id"]==sid) & (aligned["power_id"]==pid)]
+            if dfp.empty: continue
+            sw_label = str(dfp["sw3_label"].iloc[0]); pow_label = str(dfp["power_label"].iloc[0])
+            th = (dfp["timestamp_s"] - t0_global) / 3600.0
+            base = base_colors[i]
+            c_int = darken(base, 0.35)   # darker for intensity
+            c_pow = lighten(base, 0.60)  # lighter for power
+            if show_int:
+                ax1.plot(th, dfp["intensity_ema"].to_numpy(), label=f"{sw_label} (optical)", alpha=l_alpha, color=c_int, linewidth=2)
+            if show_pow:
+                ax2.plot(th, dfp["power_ema"].to_numpy(), label=f"{pow_label} (power)", alpha=l_alpha, color=c_pow, linewidth=2)
+            if show_pts:
+                ax1.scatter(th, dfp["intensity_ema"].to_numpy(), s=8, alpha=p_alpha, color=c_int)
+
+        ax1.set_xlabel("Time since earliest pair start (hours)")
         ax1.set_ylabel("Intensity (µW/cm²)")
         ax2.set_ylabel("Power (W)")
         ax1.grid(True, linestyle="--", alpha=0.5)
-        # Build a combined legend
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax2.legend(lines1+lines2, labels1+labels2, loc="best")
-        fig_ts.tight_layout()
-        self._last_fig = fig_ts
+        fig.tight_layout()
+        self._register_fig('ovp', fig)
         plt.show(block=False)
+        self._set_status(f"Analyzed group '{self.groups[gid].name}' — time series plotted (optical vs power).")
 
-        # 2) CCF plot
-        fig_ccf = plt.figure()
-        axc = fig_ccf.add_subplot(111)
-        axc.plot(lags, ccf_vals)
-        axc.axvline(0, linestyle="--", alpha=0.5)
+    def on_corr_and_scatter(self):
+        # Close old correlation windows
+        self._close_plots('corr')
+
+        if self._aligned_cache is None or self._aligned_cache.empty:
+            gdisp = self.ovp_group_display.get()
+            gid = self._display_to_group_id(gdisp)
+            if gid and gid in self.groups:
+                self._aligned_cache = self._build_aligned_for_group(gid)
+        aligned = self._aligned_cache
+        if aligned is None or aligned.empty:
+            messagebox.showinfo("Correlation", "Run 'Analyze Group' first (or ensure aligned data exists)."); return
+
+        x = aligned["intensity_ema"].to_numpy(dtype=float)
+        y = aligned["power_ema"].to_numpy(dtype=float)
+
+        # Cross-correlation scan
+        lags = np.arange(-int(self.ccf_max_lag_s.get()), int(self.ccf_max_lag_s.get())+1, 1, dtype=int)
+        ccf_vals = []
+        for lag in lags:
+            if lag < 0: x_lag = x[-lag:]; y_lag = y[:len(x_lag)]
+            elif lag > 0: y_lag = y[lag:]; x_lag = x[:len(y_lag)]
+            else: x_lag = x; y_lag = y
+            if x_lag.size==0 or y_lag.size==0 or np.std(x_lag)==0 or np.std(y_lag)==0:
+                ccf_vals.append(np.nan)
+            else:
+                ccf_vals.append(float(np.corrcoef(x_lag, y_lag)[0,1]))
+        ccf_vals = np.array(ccf_vals, dtype=float)
+        best_idx = int(np.nanargmax(np.abs(ccf_vals))) if np.isfinite(ccf_vals).any() else None
+        best_lag = int(lags[best_idx]) if best_idx is not None else None
+        best_ccf = float(ccf_vals[best_idx]) if best_idx is not None else float("nan")
+
+        # 1) CCF plot
+        fig_ccf = plt.figure(); axc = fig_ccf.add_subplot(111)
+        axc.plot(lags, ccf_vals); axc.axvline(0, linestyle="--", alpha=0.5)
         if best_idx is not None:
             axc.axvline(best_lag, linestyle=":")
             y_text = np.nanmax(ccf_vals) if np.isfinite(ccf_vals).any() else 0.0
             axc.text(best_lag, y_text, f"best lag={best_lag}s\nr={best_ccf:.3f}", ha="center", va="bottom")
-        axc.set_title("Cross‑correlation (Intensity vs Power)")
-        axc.set_xlabel("Lag (s) [positive = intensity lags power]")
-        axc.set_ylabel("Correlation")
-        axc.grid(True, linestyle="--", alpha=0.5)
-        fig_ccf.tight_layout()
-        self._last_fig = fig_ccf
-        plt.show(block=False)
+        axc.set_title("Cross‑correlation (optical vs power)")
+        axc.set_xlabel("Lag (s) [positive = optical lags power]"); axc.set_ylabel("Correlation")
+        axc.grid(True, linestyle="--", alpha=0.5); fig_ccf.tight_layout()
+        self._register_fig('corr', fig_ccf); plt.show(block=False)
 
-        # 3) Scatter + regression
+        # 2) Scatter + regression
         slope, intercept, r_lin = linear_regression(aligned["power_ema"].to_numpy(), aligned["intensity_ema"].to_numpy())
-        fig_sc = plt.figure()
-        axs = fig_sc.add_subplot(111)
-        axs.scatter(aligned["power_ema"], aligned["intensity_ema"], s=10, alpha=0.3)
+        fig_sc = plt.figure(); axs = fig_sc.add_subplot(111)
+        # color per unique pair by IDs
+        pair_ids = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
+        base_colors = get_cmap_colors(len(pair_ids), "viridis")
+        for i, (sid, pid) in enumerate(pair_ids):
+            dfp = aligned[(aligned["sw3_id"]==sid) & (aligned["power_id"]==pid)]
+            sw_label = str(dfp["sw3_label"].iloc[0]); pow_label = str(dfp["power_label"].iloc[0])
+            axs.scatter(dfp["power_ema"], dfp["intensity_ema"], s=10, alpha=0.25, label=f"{sw_label} vs {pow_label}", color=base_colors[i])
         if np.isfinite(slope) and np.isfinite(intercept):
-            xs = np.linspace(aligned["power_ema"].min(), aligned["power_ema"].max(), 100)
+            xs = np.linspace(aligned["power_ema"].min(), aligned["power_ema"].max(), 200)
             ys = slope*xs + intercept
-            axs.plot(xs, ys, linewidth=2, label=f"Fit: y={slope:.3f}x+{intercept:.3f}  r={r_lin:.3f}")
-        axs.set_xlabel("Power (W) [EMA]")
-        axs.set_ylabel("Intensity (µW/cm²) [EMA]")
-        axs.grid(True, linestyle="--", alpha=0.5)
-        axs.legend()
-        fig_sc.tight_layout()
-        self._last_fig = fig_sc
-        plt.show(block=False)
-
-        msg = f"Pearson r (EMA series): {r:.3f}\nBest CCF lag: {best_lag}s (r={best_ccf:.3f})"
-        self._set_status(msg)
-        messagebox.showinfo("Analysis", msg)
-
-        # Keep the aligned frame for export
-        self._aligned_cache = aligned
-
-    def on_scatter_fit(self):
-        # Convenience: if user clicks it separately (already handled in on_analyze_group)
-        if not hasattr(self, "_aligned_cache") or self._aligned_cache.empty:
-            messagebox.showinfo("Scatter", "Run 'Analyze Group' first.")
-            return
-        aligned = self._aligned_cache
-        slope, intercept, r_lin = linear_regression(aligned["power_ema"].to_numpy(), aligned["intensity_ema"].to_numpy())
-        fig_sc = plt.figure()
-        axs = fig_sc.add_subplot(111)
-        axs.scatter(aligned["power_ema"], aligned["intensity_ema"], s=10, alpha=0.3)
-        if np.isfinite(slope) and np.isfinite(intercept):
-            xs = np.linspace(aligned["power_ema"].min(), aligned["power_ema"].max(), 100)
-            ys = slope*xs + intercept
-            axs.plot(xs, ys, linewidth=2, label=f"Fit: y={slope:.3f}x+{intercept:.3f}  r={r_lin:.3f}")
-        axs.set_xlabel("Power (W) [EMA]")
-        axs.set_ylabel("Intensity (µW/cm²) [EMA]")
-        axs.grid(True, linestyle="--", alpha=0.5)
-        axs.legend()
-        fig_sc.tight_layout()
-        self._last_fig = fig_sc
-        plt.show(block=False)
+            axs.plot(xs, ys, linewidth=2, alpha=0.9, label=f"Fit: y={slope:.3f}x+{intercept:.3f}  r={r_lin:.3f}")
+        axs.set_title("Optical vs Power — Scatter + Fit")
+        axs.set_xlabel("Power (W) [EMA]"); axs.set_ylabel("Intensity (µW/cm²) [EMA]"); axs.grid(True, linestyle="--", alpha=0.5)
+        axs.legend(); fig_sc.tight_layout(); self._register_fig('corr', fig_sc); plt.show(block=False)
 
     def on_export_aligned_csv(self):
-        if not hasattr(self, "_aligned_cache") or self._aligned_cache.empty:
-            messagebox.showinfo("Export", "No aligned data to export. Run 'Analyze Group' first.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Export Aligned CSV", defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")])
-        if not path:
-            return
-        df = self._aligned_cache.copy()
-        # Make columns user‑friendly
-        df = df.rename(columns={"timestamp_s": "Timestamp", "intensity_ema": "Intensity_EMA_uW_cm2", "power_ema": "Power_EMA_W"})
-        df[["Timestamp", "Intensity_EMA_uW_cm2", "Power_EMA_W"]].to_csv(path, index=False)
+        if self._aligned_cache is None or self._aligned_cache.empty:
+            messagebox.showinfo("Export", "No aligned data to export. Run 'Analyze Group' first."); return
+        path = filedialog.asksaveasfilename(title="Export Aligned CSV", defaultextension=".csv",
+                                            filetypes=[("CSV","*.csv")])
+        if not path: return
+        df = self._aligned_cache.rename(columns={
+            "timestamp_s":"Timestamp", "intensity_ema":"Intensity_EMA_uW_cm2", "power_ema":"Power_EMA_W"
+        }).copy()
+        keep = ["Timestamp","Intensity_EMA_uW_cm2","Power_EMA_W","group_id","sw3_id","power_id","sw3_label","power_label"]
+        df[keep].to_csv(path, index=False)
         self._set_status(f"Exported aligned CSV to {path}")
 
-    # -------------------------
-    # Analysis: Group Decay Overlay
-    # -------------------------
-    def on_plot_group_decay(self):
-        if not self.groups:
-            messagebox.showinfo("Plot", "No groups available.")
-            return
+    # ---- Analysis: Group Decay Overlay ----
+    def on_plot_group_decay(self, selected_only: bool):
+        # Auto-close prior GDO figs
+        self._close_plots('gdo')
+
         ema_span = int(self.overlay_ema_span.get())
         only_zero = self.only_yaw_roll_zero.get()
-        normalize = self.normalize_to_1m.get()
+        norm_1m   = self.normalize_to_1m.get()
+        show_pts  = self.gdo_show_points.get()
+        show_line = self.gdo_show_ema.get()
+        p_alpha   = float(self.gdo_point_alpha.get())
+        l_alpha   = float(self.gdo_line_alpha.get())
 
-        group_curves = []  # list of (group_name, time_hours, percent)
-        for gid, g in self.groups.items():
-            # Gather all SW3 in group
-            sw3_ids = [fid for fid in g.file_ids if self.files.get(fid) and self.files[fid].kind == "sw3"]
+        if selected_only:
+            idxs = self.lb_groups_select.curselection()
+            gids = [self.lb_groups_select.get(i).split("  ")[0] for i in idxs]
+        else:
+            gids = list(self.groups.keys())
+        if not gids:
+            messagebox.showinfo("Plot", "No groups selected."); return
+
+        base_colors = get_cmap_colors(len(gids), "viridis")
+        fig = plt.figure(); ax = fig.add_subplot(111)
+
+        for i, gid in enumerate(gids):
+            g = self.groups.get(gid); 
+            if not g: continue
+            sw3_ids = [fid for fid in g.file_ids if self.files.get(fid) and self.files[fid].kind=="sw3"]
             rows_all = []
             for sid in sw3_ids:
                 rec = self.files[sid]
                 try:
-                    with open(rec.path, "rb") as fd:
-                        buf = fd.read()
+                    with open(rec.path, "rb") as fd: buf = fd.read()
                     ensure_eegbin_imported()
-                    try:
-                        sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
-                    except Exception:
-                        sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
+                    try: sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
+                    except Exception: sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
                 except Exception as e:
-                    messagebox.showwarning("Load error", f"Failed to load {rec.path}\n{e}")
-                    continue
+                    messagebox.showwarning("Load error", f"Failed to load {rec.path}\n{e}"); continue
                 for r in sweep.rows:
-                    if hasattr(r, "valid") and not r.valid:
-                        continue
-                    if only_zero and not (getattr(r.coords, "yaw_deg", None) == 0 and getattr(r.coords, "roll_deg", None) == 0):
-                        continue
-                    if getattr(r, "timestamp", None) is None:
-                        continue
-                    I_wm2 = float(getattr(r.capture, "integral_result", 0.0) or 0.0)
-                    if normalize:
-                        dist_m = float(getattr(r.coords, "lin_mm", 0.0) or 0.0) / 1000.0
-                        if dist_m > 0:
-                            I_wm2 = I_wm2 * (dist_m**2)
-                    I_uW_cm2 = I_wm2 * 100.0
-                    rows_all.append( (float(r.timestamp) + g.offset_s, I_uW_cm2) )
+                    if hasattr(r, "valid") and not r.valid: continue
+                    if only_zero and not (getattr(r.coords,"yaw_deg",None)==0 and getattr(r.coords,"roll_deg",None)==0): continue
+                    if getattr(r, "timestamp", None) is None: continue
+                    I_wm2 = float(getattr(r.capture,"integral_result",0.0) or 0.0)
+                    if norm_1m:
+                        dist_m = float(getattr(r.coords,"lin_mm",0.0) or 0.0)/1000.0
+                        if dist_m>0: I_wm2 = I_wm2*(dist_m**2)
+                    I_uW_cm2 = I_wm2*100.0
+                    rows_all.append((float(r.timestamp)+g.offset_s, I_uW_cm2))
+            if not rows_all: continue
+            rows_all.sort(key=lambda x:x[0])
+            t = np.array([r[0] for r in rows_all]); y = np.array([r[1] for r in rows_all])
+            y_ema = ema(y, ema_span)
+            y_pct = (y_ema/y_ema.max())*100.0 if y_ema.max()>0 else np.zeros_like(y_ema)
+            th = (t - t[0]) / 3600.0
+            c = base_colors[i]
+            if show_pts: ax.scatter(th, y_pct, s=8, alpha=p_alpha, color=c, label=f"{g.name} (pts)")
+            if show_line: ax.plot(th, y_pct, linewidth=2, alpha=l_alpha, color=c, label=g.name)
 
-            if not rows_all:
-                continue
-            rows_all.sort(key=lambda x: x[0])
-            t = np.array([r[0] for r in rows_all], dtype=float)
-            y = np.array([r[1] for r in rows_all], dtype=float)
-            y_ema = ema_series(y, ema_span)
-            # Normalize to peak = 100%
-            if y_ema.max() > 0:
-                y_pct = (y_ema / y_ema.max()) * 100.0
-            else:
-                y_pct = np.zeros_like(y_ema)
-            t_hours = (t - t[0]) / 3600.0
-            group_curves.append( (self.groups[gid].name, t_hours, y_pct) )
-
-        if not group_curves:
-            messagebox.showinfo("Plot", "No data to plot.")
-            return
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        for name, th, yp in group_curves:
-            ax.plot(th, yp, label=name, linewidth=2)
         ax.set_title("Decay Overlay by Group (EMA, normalized to each group’s peak)")
-        ax.set_xlabel("Hours since group start")
-        ax.set_ylabel("Intensity (% of peak)")
-        ax.grid(True, linestyle="--", alpha=0.5)
-        ax.legend()
-        fig.tight_layout()
-        self._last_fig = fig
-        plt.show(block=False)
-        self._set_status("Plotted group decay overlay.")
+        ax.set_xlabel("Hours since group start"); ax.set_ylabel("Intensity (% of peak)")
+        ax.grid(True, linestyle="--", alpha=0.5); ax.legend()
+        fig.tight_layout(); self._register_fig('gdo', fig); plt.show(block=False)
 
-    # -------------------------
-    # Misc
-    # -------------------------
+    # ---- Plot utils ----
+    def _register_fig(self, cat: str, fig: plt.Figure):
+        self._figs.setdefault(cat, []).append(fig)
+
+    def _close_plots(self, cat: str, also: Tuple[str, ...]=()):
+        cats = (cat,) + tuple(also)
+        for c in cats:
+            figs = self._figs.get(c, [])
+            for f in figs:
+                try: plt.close(f)
+                except Exception: pass
+            self._figs[c] = []
+        # status update (non-intrusive; useful when called from buttons)
+        if also:
+            self._set_status(f"Closed {', '.join(cats)} plot windows.")
+
+    def _select_all_groups(self):
+        self.lb_groups_select.selection_set(0, tk.END)
+
     def on_save_last_figure(self):
-        if self._last_fig is None:
-            messagebox.showinfo("Save Figure", "No figure to save yet.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Save Figure", defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
-        if not path:
-            return
-        self._last_fig.savefig(path, dpi=150, bbox_inches="tight")
-        self._set_status(f"Saved figure to {path}")
+        # Save the last-created figure across categories
+        for cat in ("ivt","ovp","gdo","corr"):
+            if self._figs.get(cat):
+                last_fig = self._figs[cat][-1]
+                path = filedialog.asksaveasfilename(title="Save Figure", defaultextension=".png",
+                                                    filetypes=[("PNG","*.png"),("PDF","*.pdf"),("SVG","*.svg")])
+                if not path: return
+                last_fig.savefig(path, dpi=150, bbox_inches="tight")
+                self._set_status(f"Saved figure to {path}")
+                return
+        messagebox.showinfo("Save Figure", "No figure to save yet.")
 
     def _set_status(self, text: str):
         self.status_var.set(text)
 
     def _next_file_id(self) -> str:
-        base = "F"
-        i = 1
-        while f"{base}{i:03d}" in self.files:
-            i += 1
-        return f"{base}{i:03d}"
+        i=1
+        while f"F{i:03d}" in self.files: i+=1
+        return f"F{i:03d}"
 
     def _next_group_id(self) -> str:
-        base = "G"
-        i = 1
-        while f"{base}{i:03d}" in self.groups:
-            i += 1
-        return f"{base}{i:03d}"
+        i=1
+        while f"G{i:03d}" in self.groups: i+=1
+        return f"G{i:03d}"
 
-
-# -----------------------------
-# Association editor dialog
-# -----------------------------
+# ---- Association dialog ----
 
 class AssociationDialog(tk.Toplevel):
     def __init__(self, master: App, group: GroupRecord, sw3_list, power_list):
         super().__init__(master)
-        self.title(f"Associations for '{group.name}'")
-        self.resizable(True, True)
-        self.group = group
-        self.updated = False
+        self.title(f"Associations for '{group.name}'"); self.resizable(True, True)
+        self.group = group; self.updated = False
 
-        # Layout: SW3 list on left, Power list on right, with add/remove buttons
-        pane = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        # Build ID→label helpers
+        self.sw3_id_to_label = {fid: fr.label for fid, fr in sw3_list}
+        self.pow_id_to_label = {fid: fr.label for fid, fr in power_list}
 
+        pane = ttk.Panedwindow(self, orient=tk.HORIZONTAL); pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         left = ttk.Frame(pane); pane.add(left, weight=1)
         right = ttk.Frame(pane); pane.add(right, weight=1)
 
         ttk.Label(left, text="SW3 files").pack(anchor="w")
         self.lb_sw3 = tk.Listbox(left, selectmode=tk.SINGLE, exportselection=False)
-        for fid, fr in sw3_list:
-            self.lb_sw3.insert(tk.END, f"{fr.label} ({fid})")
-        self.sw3_ids = [fid for fid, _ in sw3_list]
-        self.lb_sw3.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        for fid, fr in sw3_list: self.lb_sw3.insert(tk.END, f"{fr.label} ({fid})")
+        self.sw3_ids = [fid for fid,_ in sw3_list]; self.lb_sw3.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
 
         ttk.Label(right, text="Power files").pack(anchor="w")
         self.lb_pow = tk.Listbox(right, selectmode=tk.MULTIPLE, exportselection=False)
-        for fid, fr in power_list:
-            self.lb_pow.insert(tk.END, f"{fr.label} ({fid})")
-        self.pow_ids = [fid for fid, _ in power_list]
-        self.lb_pow.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        for fid, fr in power_list: self.lb_pow.insert(tk.END, f"{fr.label} ({fid})")
+        self.pow_ids = [fid for fid,_ in power_list]; self.lb_pow.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
 
-        # Buttons
         btns = ttk.Frame(self); btns.pack(fill=tk.X, padx=6, pady=6)
         ttk.Button(btns, text="Map selected SW3 → selected Power", command=self._map_selected).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="Remove mapping", command=self._remove_mapping).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=3)
 
-        # Mapping preview
-        self.tv_map = ttk.Treeview(self, columns=("sw3", "powers"), show="headings", height=6)
-        self.tv_map.heading("sw3", text="SW3")
-        self.tv_map.heading("powers", text="Power")
-        self.tv_map.column("sw3", stretch=True, width=200)
-        self.tv_map.column("powers", stretch=True, width=400)
+        # Mapping preview (always shows ALL mappings)
+        self.tv_map = ttk.Treeview(self, columns=("sw3", "powers"), show="headings", height=8)
+        self.tv_map.heading("sw3", text="SW3 (friendly)")
+        self.tv_map.heading("powers", text="Power (friendly)")
+        self.tv_map.column("sw3", stretch=True, width=260)
+        self.tv_map.column("powers", stretch=True, width=480)
         self.tv_map.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self._refresh_mapping()
 
-        self.lb_sw3.bind("<<ListboxSelect>>", lambda e: self._refresh_mapping())
+        # Help
+        ttk.Label(self, text="Tip: You can map the **same power** to multiple SW3 files. Mapping never removes existing pairs unless you click “Remove mapping”.").pack(anchor="w", padx=8, pady=(0,6))
 
     def _map_selected(self):
-        idx_sw = self.lb_sw3.curselection()
-        idx_pw = self.lb_pow.curselection()
-        if not idx_sw or not idx_pw:
-            return
-        sw_id = self.sw3_ids[idx_sw[0]]
-        pow_ids = [self.pow_ids[i] for i in idx_pw]
-        s = self.group.associations.get(sw_id, set())
-        s |= set(pow_ids)
-        self.group.associations[sw_id] = s
-        self.updated = True
-        self._refresh_mapping()
+        idx_sw = self.lb_sw3.curselection(); idx_pw = self.lb_pow.curselection()
+        if not idx_sw or not idx_pw: return
+        sw_id = self.sw3_ids[idx_sw[0]]; pow_ids = [self.pow_ids[i] for i in idx_pw]
+        s = self.group.associations.get(sw_id, set()); s |= set(pow_ids)
+        self.group.associations[sw_id] = s; self.updated = True; self._refresh_mapping()
 
     def _remove_mapping(self):
-        idx_sw = self.lb_sw3.curselection()
-        if not idx_sw:
-            return
-        sw_id = self.sw3_ids[idx_sw[0]]
-        # remove any selected power from mapping
-        idx_pw = self.lb_pow.curselection()
-        if not idx_pw:
-            # remove all
-            if sw_id in self.group.associations:
-                del self.group.associations[sw_id]
+        idx_sw = self.lb_sw3.curselection(); 
+        if not idx_sw: return
+        sw_id = self.sw3_ids[idx_sw[0]]; idx_pw = self.lb_pow.curselection()
+        if not idx_pw: self.group.associations.pop(sw_id, None)
         else:
             s = self.group.associations.get(sw_id, set())
-            for i in idx_pw:
-                s.discard(self.pow_ids[i])
-            if s:
-                self.group.associations[sw_id] = s
-            else:
-                self.group.associations.pop(sw_id, None)
-        self.updated = True
-        self._refresh_mapping()
+            for i in idx_pw: s.discard(self.pow_ids[i])
+            if s: self.group.associations[sw_id] = s
+            else: self.group.associations.pop(sw_id, None)
+        self.updated = True; self._refresh_mapping()
 
     def _refresh_mapping(self):
-        for item in self.tv_map.get_children():
-            self.tv_map.delete(item)
-        # Show only the currently selected SW3 for convenience
-        idx_sw = self.lb_sw3.curselection()
-        if idx_sw:
-            sw_id = self.sw3_ids[idx_sw[0]]
-            powers = sorted(list(self.group.associations.get(sw_id, set())))
-            self.tv_map.insert("", "end", values=(sw_id, ", ".join(powers)))
-        else:
-            # show all
-            for sw_id, pset in self.group.associations.items():
-                self.tv_map.insert("", "end", values=(sw_id, ", ".join(sorted(list(pset)))))
+        for item in self.tv_map.get_children(): self.tv_map.delete(item)
+        # Always show all mappings
+        for sw_id, pset in sorted(self.group.associations.items()):
+            sw_name = f"{self.sw3_id_to_label.get(sw_id, sw_id)} ({sw_id})"
+            pow_names = [self.pow_id_to_label.get(pid, pid) for pid in sorted(pset)]
+            self.tv_map.insert("", "end", values=(sw_name, ", ".join(pow_names)))
 
-
-# -----------------------------
-# Entrypoint
-# -----------------------------
+# ---- Entrypoint ----
 
 def main():
     app = App()
