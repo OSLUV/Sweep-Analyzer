@@ -46,13 +46,30 @@ jobs:
           python -c "import matplotlib, numpy, pandas, PIL; print('matplotlib', matplotlib.__version__); print('numpy', numpy.__version__); print('pandas', pandas.__version__); print('pillow', PIL.__version__)"
           python -c "import scipy; print('scipy', scipy.__version__)"
 
-      # macOS: .app bundle (no signing; keep simple)
+      - name: Prepare macOS icon
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          from PIL import Image, ImageDraw
+          img = Image.new('RGBA', (1024, 1024), (37, 99, 235, 255))  # blue
+          draw = ImageDraw.Draw(img)
+          draw.rounded_rectangle([72,72,952,952], radius=140, outline=(255,255,255,255), width=24)
+          img.save('icon.png')
+          PY
+          mkdir -p icon.iconset
+          for SIZE in 16 32 64 128 256 512 1024; do
+            /usr/bin/sips -z $SIZE $SIZE icon.png --out icon.iconset/icon_${SIZE}x${SIZE}.png >/dev/null
+          done
+          /usr/bin/iconutil -c icns icon.iconset -o app.icns
+
+      # macOS: .app bundle with explicit icon
       - name: PyInstaller (macOS .app)
         if: runner.os == 'macOS'
         run: |
           pyinstaller --noconfirm --clean \
             --windowed \
             --name SW3PowerAnalyzer \
+            --icon app.icns \
             --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy --collect-all PIL \
             --collect-binaries PIL \
             --hidden-import matplotlib.backends.backend_tkagg \
