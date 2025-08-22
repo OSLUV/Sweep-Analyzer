@@ -50,8 +50,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           python - <<'PY'
-          from PIL import Image
-          Image.new('RGBA',(1024,1024),(0,0,0,0)).save('icon.png')
+          from PIL import Image, ImageDraw
+          # Create simple colored icon (avoids "blank" look)
+          img = Image.new('RGBA', (1024, 1024), (37, 99, 235, 255))  # blue
+          draw = ImageDraw.Draw(img)
+          # white border
+          draw.rectangle([64,64,960,960], outline=(255,255,255,255), width=24)
+          img.save('icon.png')
           PY
           mkdir -p icon.iconset
           for SIZE in 16 32 64 128 256 512 1024; do
@@ -59,7 +64,7 @@ jobs:
           done
           /usr/bin/iconutil -c icns icon.iconset -o app.icns
 
-      # macOS: build a .app bundle with explicit icon (avoids missing default icon issue)
+      # macOS: .app bundle with explicit icon
       - name: PyInstaller (macOS .app)
         if: runner.os == 'macOS'
         run: |
@@ -67,41 +72,42 @@ jobs:
             --windowed \
             --name SW3PowerAnalyzer \
             --icon app.icns \
-            --collect-data matplotlib --collect-data pandas --collect-data numpy \
-            --collect-submodules matplotlib --collect-submodules pandas --collect-submodules numpy \
+            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy \
             --hidden-import matplotlib.backends.backend_tkagg \
             --hidden-import numpy._core._multiarray_umath \
             --hidden-import numpy._core._exceptions \
+            --hidden-import numpy._distributor_init \
             --hidden-import eegbin --hidden-import util \
             gui.py
 
-      # Linux: prefer onedir for reliability with many binary deps (numpy/scipy)
+      # Linux: onedir for reliability with binary deps (NumPy/SciPy)
       - name: PyInstaller (Linux onedir)
         if: runner.os == 'Linux'
         run: |
           pyinstaller --noconfirm --clean \
             --windowed \
             --name SW3PowerAnalyzer \
-            --collect-data matplotlib --collect-data pandas --collect-data numpy \
-            --collect-submodules matplotlib --collect-submodules pandas --collect-submodules numpy \
+            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy \
             --hidden-import matplotlib.backends.backend_tkagg \
             --hidden-import numpy._core._multiarray_umath \
             --hidden-import numpy._core._exceptions \
+            --hidden-import numpy._distributor_init \
             --hidden-import eegbin --hidden-import util \
             gui.py
 
-      # Windows: onefile is OK
+      # Windows: onefile, but run under Bash to accept backslash line continuations
       - name: PyInstaller (Windows onefile)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
           pyinstaller --noconfirm --clean \
             --onefile --windowed \
             --name SW3PowerAnalyzer \
-            --collect-data matplotlib --collect-data pandas --collect-data numpy \
-            --collect-submodules matplotlib --collect-submodules pandas --collect-submodules numpy \
+            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy \
             --hidden-import matplotlib.backends.backend_tkagg \
             --hidden-import numpy._core._multiarray_umath \
             --hidden-import numpy._core._exceptions \
+            --hidden-import numpy._distributor_init \
             --hidden-import eegbin --hidden-import util \
             gui.py
 
@@ -114,7 +120,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Compress-Archive -Path dist\\SW3PowerAnalyzer.exe -DestinationPath SW3PowerAnalyzer-windows-${{ runner.arch }}.zip
+          Compress-Archive -Path dist\SW3PowerAnalyzer.exe -DestinationPath SW3PowerAnalyzer-windows-${{ runner.arch }}.zip
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
