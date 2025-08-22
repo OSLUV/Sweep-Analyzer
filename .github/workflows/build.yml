@@ -37,65 +37,52 @@ jobs:
         run: |
           python -m pip install --upgrade pip wheel "setuptools<81"
           pip install -r requirements.txt
-          pip install pyinstaller==6.11.0
+          pip install pyinstaller==6.11.0 pillow
 
       - name: Show versions
         run: |
           python -c "import sys; print(sys.version)"
           python -c "import tkinter; print('tk', tkinter.TkVersion)"
-          python -c "import matplotlib, numpy, pandas; print('matplotlib', matplotlib.__version__); print('numpy', numpy.__version__); print('pandas', pandas.__version__)"
+          python -c "import matplotlib, numpy, pandas, PIL; print('matplotlib', matplotlib.__version__); print('numpy', numpy.__version__); print('pandas', pandas.__version__); print('pillow', PIL.__version__)"
           python -c "import scipy; print('scipy', scipy.__version__)"
 
-      - name: Prepare macOS icon
-        if: runner.os == 'macOS'
-        run: |
-          python - <<'PY'
-          from PIL import Image, ImageDraw
-          # Create simple colored icon (avoids "blank" look)
-          img = Image.new('RGBA', (1024, 1024), (37, 99, 235, 255))  # blue
-          draw = ImageDraw.Draw(img)
-          # white border
-          draw.rectangle([64,64,960,960], outline=(255,255,255,255), width=24)
-          img.save('icon.png')
-          PY
-          mkdir -p icon.iconset
-          for SIZE in 16 32 64 128 256 512 1024; do
-            /usr/bin/sips -z $SIZE $SIZE icon.png --out icon.iconset/icon_${SIZE}x${SIZE}.png >/dev/null
-          done
-          /usr/bin/iconutil -c icns icon.iconset -o app.icns
-
-      # macOS: .app bundle with explicit icon
+      # macOS: .app bundle (no signing; keep simple)
       - name: PyInstaller (macOS .app)
         if: runner.os == 'macOS'
         run: |
           pyinstaller --noconfirm --clean \
             --windowed \
             --name SW3PowerAnalyzer \
-            --icon app.icns \
-            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy \
+            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy --collect-all PIL \
+            --collect-binaries PIL \
             --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder \
             --hidden-import numpy._core._multiarray_umath \
             --hidden-import numpy._core._exceptions \
             --hidden-import numpy._distributor_init \
             --hidden-import eegbin --hidden-import util \
+            --runtime-hook hooks/rth_pil_tk.py \
             gui.py
 
-      # Linux: onedir for reliability with binary deps (NumPy/SciPy)
+      # Linux: onedir for reliability with scientific stack
       - name: PyInstaller (Linux onedir)
         if: runner.os == 'Linux'
         run: |
           pyinstaller --noconfirm --clean \
             --windowed \
             --name SW3PowerAnalyzer \
-            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy \
+            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy --collect-all PIL \
+            --collect-binaries PIL \
             --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder \
             --hidden-import numpy._core._multiarray_umath \
             --hidden-import numpy._core._exceptions \
             --hidden-import numpy._distributor_init \
             --hidden-import eegbin --hidden-import util \
+            --runtime-hook hooks/rth_pil_tk.py \
             gui.py
 
-      # Windows: onefile, but run under Bash to accept backslash line continuations
+      # Windows: onefile under Bash for multi-line args
       - name: PyInstaller (Windows onefile)
         if: runner.os == 'Windows'
         shell: bash
@@ -103,12 +90,15 @@ jobs:
           pyinstaller --noconfirm --clean \
             --onefile --windowed \
             --name SW3PowerAnalyzer \
-            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy \
+            --collect-all numpy --collect-all pandas --collect-all matplotlib --collect-all scipy --collect-all PIL \
+            --collect-binaries PIL \
             --hidden-import matplotlib.backends.backend_tkagg \
+            --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder \
             --hidden-import numpy._core._multiarray_umath \
             --hidden-import numpy._core._exceptions \
             --hidden-import numpy._distributor_init \
             --hidden-import eegbin --hidden-import util \
+            --runtime-hook hooks/rth_pil_tk.py \
             gui.py
 
       - name: List dist/

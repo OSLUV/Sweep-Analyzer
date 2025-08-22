@@ -54,21 +54,17 @@ See [`.github/workflows/build.yml`](.github/workflows/build.yml) for details.
 
 The macOS `.app` bundle is **unsigned**. Open it via right-click → Open (or code sign & notarize with your Apple Developer ID). You will then need to open System Settings → Privacy and Security → Security and click "Open Anyway"
 
-## Repo layout
-
-```
-.
-├── gui.py
-├── eegbin.py
-├── util.py
-├── requirements.txt
-└── .github/
-    └── workflows/
-        └── build.yml
-```
 
 ## Notes
 
 - The GUI uses `TkAgg` and bundles Tcl/Tk via PyInstaller. On Linux CI we also install the `tk` package so import works at build-time.
 - The app dynamically imports `eegbin`, so we include it as a PyInstaller **hidden import** (same for `util`).
+- On Linux you must run from inside the extracted folder so bundled Tcl/Tk & Pillow binaries are found.
+```bash
+tar -xzf SW3PowerAnalyzer-linux-<arch>.tar.gz
+cd SW3PowerAnalyzer
+./SW3PowerAnalyzer
+```
+
+
 
