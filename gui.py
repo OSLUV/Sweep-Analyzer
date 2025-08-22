@@ -205,12 +205,16 @@ def _prepare_power_series(power_df: pd.DataFrame, tmin: float, tmax: float,
     pdf = power_df.loc[mask, cols].copy()
     if pdf.empty:
         return None
+    # Build datetime index and resample
     pdf.loc[:, "timestamp"] = pd.to_datetime(pdf["Timestamp"], unit="s")
     pdf = pdf.set_index("timestamp").sort_index()
     pdf = pdf.resample(f"{int(resample_seconds)}s")["W_Active"].mean().to_frame("power")
     pdf.loc[:, "power_ema"] = pdf["power"].ewm(span=int(ema_span), adjust=False).mean()
+    # Reset and create integer seconds column without overwriting dtype in place
     pdf = pdf.dropna(subset=["power_ema"]).reset_index()
-    pdf.loc[:, "timestamp"] = pdf["timestamp"].astype("int64") // 10**9
+    pdf = pdf.rename(columns={"timestamp": "timestamp_dt"})
+    pdf["timestamp"] = (pdf["timestamp_dt"].astype("int64") // 10**9).astype("int64")
+    pdf = pdf.drop(columns=["timestamp_dt"])
     return pdf[["timestamp", "power_ema"]]
 
 def get_cmap_colors(n: int, cmap_name: str) -> List[Tuple[float, float, float, float]]:
@@ -260,7 +264,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SW3 + Power Analyzer")
-        self.geometry("1320x860")
+        # Slightly taller default to avoid hiding top bars on small screens
+        self.geometry("1320x900")
         self.minsize(960, 640)
 
         self.files: Dict[str, FileRecord] = {}
@@ -288,7 +293,7 @@ class App(tk.Tk):
         self.intensity_ema_span = tk.IntVar(self, value=31)
         self.power_ema_span     = tk.IntVar(self, value=31)
         self.overlay_ema_span   = tk.IntVar(self, value=31)
-        self.trim_start_s       = tk.IntVar(self, value=0)   # retained for IVT-only trim (not group), still useful
+        self.trim_start_s       = tk.IntVar(self, value=0)   # per-IVT extra trim
         self.trim_end_s         = tk.IntVar(self, value=0)
         self.align_tolerance_s  = tk.IntVar(self, value=2)
         self.ccf_max_lag_s      = tk.IntVar(self, value=180)
@@ -351,7 +356,7 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(self, value="Ready")
         ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill=tk.X, side=tk.BOTTOM)
 
-        # initial vertical sash positions (favor controls)
+        # initial vertical sash positions (favor controls) with minimum Files height
         self.after(120, self._set_initial_sashes)
 
     def _build_menu(self):
@@ -402,7 +407,19 @@ class App(tk.Tk):
         frm = ttk.LabelFrame(parent, text="Files")
         frm.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        container = ttk.Frame(frm); container.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        # --- TOP button bar (so it's always visible even if the pane is short) ---
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X, padx=3, pady=(6,3))
+        ttk.Button(btns, text="Add SW3…", command=self.on_add_sw3_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Add Power CSV…", command=self.on_add_power_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Rename…", command=self.on_rename_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Remove", command=self.on_remove_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Assign to Group…", command=self.on_assign_files_to_group).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(btns, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(btns, text="Reload Selected", command=lambda: self.on_reload_all_files(only_selected=True)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Reload All", command=self.on_reload_all_files).pack(side=tk.LEFT, padx=2)
+
+        # --- Treeview container BELOW the button bar ---
+        container = ttk.Frame(frm); container.pack(fill=tk.BOTH, expand=True, padx=3, pady=(3,6))
 
         cols = ("label", "kind", "first", "last", "count", "path")
         self.tv_files = ttk.Treeview(container, columns=cols, show="headings", selectmode="extended")
@@ -417,16 +434,6 @@ class App(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         container.rowconfigure(0, weight=1); container.columnconfigure(0, weight=1)
-
-        btns = ttk.Frame(frm); btns.pack(fill=tk.X, padx=3, pady=3)
-        ttk.Button(btns, text="Add SW3…", command=self.on_add_sw3_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Add Power CSV…", command=self.on_add_power_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Rename…", command=self.on_rename_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Remove", command=self.on_remove_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Assign to Group…", command=self.on_assign_files_to_group).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(btns, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(btns, text="Reload Selected", command=lambda: self.on_reload_all_files(only_selected=True)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Reload All", command=self.on_reload_all_files).pack(side=tk.LEFT, padx=2)
 
         self.tv_files.bind("<Double-1>", lambda e: self.on_rename_file())
 
@@ -555,12 +562,18 @@ class App(tk.Tk):
 
     # ---- View helpers ----
     def _set_initial_sashes(self):
-        """Files ~25%, Groups ~30%, Controls ~45%."""
+        """Favor Controls, but guarantee Files has enough height to show its button bar."""
         try:
             self.update_idletasks()
             total_h = self._paned.winfo_height() or self.winfo_height() or 800
+            MIN_FILES = 220   # ensure top button row stays visible
+            MIN_GROUPS = 180
+            # initial proportional split
             pos0 = int(total_h * 0.25)
             pos1 = int(total_h * 0.55)
+            # enforce minimum heights
+            pos0 = max(MIN_FILES, pos0)
+            pos1 = max(pos0 + MIN_GROUPS, pos1)
             self._paned.sashpos(0, pos0)
             self._paned.sashpos(1, pos1)
         except Exception:
