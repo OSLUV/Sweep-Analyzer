@@ -16,27 +16,6 @@ python gui.py
 
 > Dependencies are pinned in `requirements.txt`. Update cautiously; SciPy/Matplotlib wheels must be available for your Python/OS/arch.  
 
-## Build locally with PyInstaller
-
-```bash
-pip install pyinstaller==6.11.0
-# macOS app bundle
-pyinstaller --noconfirm --clean --windowed --name SW3PowerAnalyzer \
-  --collect-data matplotlib --collect-data pandas \
-  --collect-submodules matplotlib \
-  --hidden-import matplotlib.backends.backend_tkagg \
-  --hidden-import eegbin --hidden-import util \
-  gui.py
-
-# Windows/Linux single-file binaries
-pyinstaller --noconfirm --clean --onefile --windowed --name SW3PowerAnalyzer \
-  --collect-data matplotlib --collect-data pandas \
-  --collect-submodules matplotlib \
-  --hidden-import matplotlib.backends.backend_tkagg \
-  --hidden-import eegbin --hidden-import util \
-  gui.py
-```
-
 ## Continuous Integration (GitHub Actions)
 
 This repo includes a cross-platform workflow to build on **Ubuntu, Windows, and macOS (Intel & Apple Silicon)** and attach artifacts to releases when you push a tag starting with `v` (e.g. `v1.0.0`).  
