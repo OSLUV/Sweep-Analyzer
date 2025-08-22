@@ -1,28 +1,20 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-SW3 + Power Analyzer GUI
+SW3 + Power Analyzer GUI — vertical layout (Files → Groups → Controls)
 
 Key features
 ------------
-• Load SW3/eegbin optical files and power CSV logs
-• Label files; create groups; associate SW3↔Power (many-to-many)
-• Align by absolute epoch timestamps (power resampled to 1 s, nearest-merge with tolerance)
+• Single-column layout: Files (top), Groups (middle), Controls (bottom) — all resizable vertically.
+• Load SW3/eegbin and power CSV, label, group, and associate (many-to-many).
+• Sessions: Save/Load all state (files, groups, associations, offsets, module paths, controls, style).
+• Reload from disk (selected/all) to pick up appended data.
 • Analyses
-  - Intensity vs Time (file or whole group; normalize to 1m; EMA; trims)
-  - Optics vs Power (time-series overlay — correlation/scatter on-demand)
-  - Group Decay Overlay (EMA as % of peak; choose groups)
+  - Intensity vs Time (file or whole group; normalize to 1m; EMA; trims; per-analysis show/hide and alphas)
+  - Optics vs Power (time-series overlay with paired shades; correlation & scatter on-demand)
+  - Group Decay Overlay (EMA % of peak; choose groups; per-analysis toggles)
+• Friendly names in UI and legends (no F###/G### in controls).
+• Plot windows replace older ones automatically (per category).
 
-Recent changes based on feedback
---------------------------------
-• **Association dialog**: supports multiple SW3 mapped to the same power without substitution; preview shows **ALL mappings** with friendly names.
-• **Friendly dropdowns** for IVT/OVP use file labels & group names (disambiguated with [F###]/[G###] only when needed).
-• **Auto-close old plots** when you click a Plot button; plus explicit “Close … Plots” per tab.
-• **OVP line styling**: solid lines only, with **paired shades** (dark for *Intensity*, light for *Power*) to remain readable with dense data.
-• **Per-analysis controls**: Show/Hide Points & EMA + separate alpha sliders.
-• **Legends** use “`<sw3 label> (optical)`” and “`<csv label> (power)`” (no arrows).
-
-Requirements: Python 3.9+, numpy, pandas, matplotlib (scipy optional).
+Requires: Python 3.9+, numpy, pandas, matplotlib (scipy optional), tkinter (system).
 """
 
 from __future__ import annotations
@@ -51,10 +43,86 @@ try:
 except Exception:
     scipy_stats = None
 
-# Lazily loaded module for SW3 parsing
+
+
+def _install_minimal_util_stub():
+    """Provide a minimal 'util' module so eegbin can import without imgui.
+    Only the functions used by various repos are provided as no-ops.
+    """
+    import types, sys as _sys
+    if "util" in _sys.modules:
+        return
+    util = types.ModuleType("util")
+    # ----- no-UI helpers -----
+    def inclusive_range(start, stop, step):
+        if step == 0:
+            return []
+        out = []
+        s = float(start)
+        # mimic original (positive step, inclusive while start <= stop)
+        if step > 0:
+            while s <= stop:
+                out.append(s)
+                s += step
+        else:
+            while s >= stop:
+                out.append(s)
+                s += step
+        return out
+    # ----- imgui-driven edit helpers replaced by safe no-ops -----
+    def do_editable_raw(preamble, value, units="", width=100):
+        # return (changed_flag, value). We never change values here.
+        return (False, value)
+    def do_editable(preamble, value, units="", width=100, enable=True):
+        # just return the original value unchanged
+        return value
+    util.inclusive_range = inclusive_range
+    util.do_editable_raw = do_editable_raw
+    util.do_editable = do_editable
+    _sys.modules["util"] = util
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# lazily loaded
 eegbin = None
 _EXTRA_MODULE_PATHS: List[str] = []
 
+
+# --- Optional util shim (avoids imgui dependency if util.py isn't available) ---
+def _ensure_util_shim():
+    import sys, types
+    if 'util' in sys.modules:
+        return
+    util = types.ModuleType('util')
+    def inclusive_range(start, stop, step):
+        if step == 0: return []
+        out = []
+        if step > 0:
+            while start <= stop:
+                out.append(start); start += step
+        else:
+            while start >= stop:
+                out.append(start); start += step
+        return out
+    def do_editable_raw(preamble, value, units="", width=100):
+        return (False, value)
+    def do_editable(preamble, value, units="", width=100, enable=True):
+        return value
+    util.inclusive_range = inclusive_range
+    util.do_editable_raw = do_editable_raw
+    util.do_editable = do_editable
+    sys.modules['util'] = util
+_ensure_util_shim()
+
+# --- Colormap helper (Matplotlib 3.7+; falls back for older) ---
+try:
+    from matplotlib import colormaps as _mpl_cmaps
+    def _get_cmap(name):
+        return _mpl_cmaps.get_cmap(name)
+except Exception:
+    def _get_cmap(name):
+        from matplotlib import pyplot as _plt
+        return _plt.get_cmap(name)
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -109,12 +177,19 @@ def ensure_eegbin_imported():
         eegbin = importlib.import_module("eegbin")
         return
     except ModuleNotFoundError as e1:
+        # If the missing module is 'util' or 'imgui', install a stub and retry
+        missing = getattr(e1, 'name', '')
+        if missing in ('util', 'imgui'):
+            _install_minimal_util_stub()
+            try:
+                eegbin = importlib.import_module('eegbin')
+                return
+            except Exception:
+                pass
         missing = getattr(e1, "name", "eegbin")
-        if messagebox.askyesno(
-            "Locate module",
-            "Could not import '{}'.\nSelect the folder containing 'eegbin.py' and 'util.py'."
-            .format(missing)
-        ):
+        if messagebox.askyesno("Locate module",
+                               "Could not import '{}'.\nSelect the folder containing 'eegbin.py' and 'util.py'."
+                               .format(missing)):
             folder = filedialog.askdirectory(title="Select folder containing eegbin.py and util.py")
             if folder:
                 _add_module_path(folder)
@@ -124,7 +199,7 @@ def ensure_eegbin_imported():
                 except Exception:
                     pass
         messagebox.showerror("Import error",
-                             "Could not import 'eegbin'. Missing: {}\n\n"
+                             "Could not import 'eegbin'. Missing: {}\n"
                              "Tip: Put gui.py next to eegbin.py/util.py, or use Settings → Add Module Path…".format(missing))
         raise
 
@@ -159,7 +234,31 @@ def merge_asof_seconds(df_left: pd.DataFrame, df_right: pd.DataFrame, tolerance_
     merged["timestamp_s"] = merged["timestamp"].astype("int64") // 10**9
     return merged
 
-def get_cmap_colors(n: int, cmap_name: str) -> List[Tuple[float, float, float, float]]:
+
+def _prepare_power_series(power_df: pd.DataFrame, tmin: float, tmax: float,
+                          ema_span: int, resample_seconds: int) -> Optional[pd.DataFrame]:
+    """Select a time window, resample to N seconds, compute EMA. Returns columns ['timestamp','power_ema'].
+       Returns None if empty after processing.
+    """
+    # Select window and needed columns, then copy to avoid SettingWithCopy warnings
+    mask = (power_df["Timestamp"] >= tmin) & (power_df["Timestamp"] <= tmax)
+    cols = ["Timestamp", "W_Active"]
+    pdf = power_df.loc[mask, cols].copy()
+    if pdf.empty:
+        return None
+    # Build datetime index and resample
+    pdf.loc[:, "timestamp"] = pd.to_datetime(pdf["Timestamp"], unit="s")
+    pdf = pdf.set_index("timestamp").sort_index()
+    # Use lowercase 's' to avoid FutureWarning
+    pdf = pdf.resample(f"{int(resample_seconds)}s")["W_Active"].mean().to_frame("power")
+    pdf.loc[:, "power_ema"] = pdf["power"].ewm(span=int(ema_span), adjust=False).mean()
+    pdf = pdf.dropna(subset=["power_ema"]).reset_index()
+    # Back to epoch seconds
+    pdf.loc[:, "timestamp"] = pdf["timestamp"].astype("int64") // 10**9
+    return pdf[["timestamp", "power_ema"]]
+
+
+def get_cmap_colors(n: int, cmap_name: str="viridis") -> List[Tuple[float, float, float, float]]:
     cmap = mpl_cm.get_cmap(cmap_name)
     xs = np.linspace(0.1, 0.9, max(1, n))
     return [cmap(x) for x in xs]
@@ -167,11 +266,11 @@ def get_cmap_colors(n: int, cmap_name: str) -> List[Tuple[float, float, float, f
 def _to_rgb(color):
     return np.array(mpl_colors.to_rgb(color))
 
-def lighten(color, amount=0.6):
+def lighten(color, amount=0.5):
     c = _to_rgb(color)
     return tuple(np.clip(1 - (1 - c) * (1 - amount), 0, 1))
 
-def darken(color, amount=0.35):
+def darken(color, amount=0.5):
     c = _to_rgb(color)
     return tuple(np.clip(c * (1 - (1 - amount)), 0, 1))
 
@@ -203,13 +302,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SW3 + Power Analyzer")
-        self.geometry("1320x840")
-        self.minsize(960, 620)
+        self.geometry("1200x900")
+        self.minsize(900, 700)
 
         self.files: Dict[str, FileRecord] = {}
         self.groups: Dict[str, GroupRecord] = {}
 
-        # display-name maps for friendly dropdowns
+        # display-name maps
         self._sw3_display_to_id: Dict[str, str] = {}
         self._group_display_to_id: Dict[str, str] = {}
 
@@ -221,7 +320,7 @@ class App(tk.Tk):
         self._init_vars()
         self._build_ui()
 
-        # figure registry (auto-close support)
+        # figure registry
         self._figs: Dict[str, List[plt.Figure]] = {"ivt": [], "ovp": [], "gdo": [], "corr": []}
         self._aligned_cache: Optional[pd.DataFrame] = None
 
@@ -258,12 +357,12 @@ class App(tk.Tk):
         self.gdo_point_alpha    = tk.DoubleVar(self, value=0.15)
         self.gdo_line_alpha     = tk.DoubleVar(self, value=1.0)
 
-        # friendly combos
+        # combos (friendly display strings)
         self.ivt_sw3_display    = tk.StringVar(self, value="")
         self.ivt_group_display  = tk.StringVar(self, value="")
         self.ovp_group_display  = tk.StringVar(self, value="")
 
-        # IVT source mode
+        # source mode
         self.source_mode        = tk.StringVar(self, value="file")  # 'file' or 'group'
         self.combine_group_sw3  = tk.BooleanVar(self, value=True)
 
@@ -274,27 +373,27 @@ class App(tk.Tk):
     def _build_ui(self):
         self._build_menu()
 
-        self._paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        # Single vertical panedwindow with three panes
+        self._paned = ttk.Panedwindow(self, orient=tk.VERTICAL)
         self._paned.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(self._paned); self._paned.add(left, weight=2)
-        left_panes = ttk.Panedwindow(left, orient=tk.VERTICAL); left_panes.pack(fill=tk.BOTH, expand=True)
+        files_container = ttk.Frame(self._paned)
+        groups_container = ttk.Frame(self._paned)
+        self._controls_frame = ttk.Frame(self._paned)
 
-        files_container = ttk.Frame(left_panes)
-        groups_container = ttk.Frame(left_panes)
-        left_panes.add(files_container, weight=3)
-        left_panes.add(groups_container, weight=2)
-
-        self._controls = ttk.Frame(self._paned); self._paned.add(self._controls, weight=3)
+        self._paned.add(files_container, weight=4)
+        self._paned.add(groups_container, weight=3)
+        self._paned.add(self._controls_frame, weight=2)
 
         self._build_files_frame(files_container)
         self._build_groups_frame(groups_container)
-        self._build_controls(self._controls)
+        self._build_controls(self._controls_frame)
 
         # status
         self.status_var = tk.StringVar(self, value="Ready")
         ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill=tk.X, side=tk.BOTTOM)
 
+        # initial vertical sash positions
         self.after(120, self._set_initial_sashes)
 
     def _build_menu(self):
@@ -321,10 +420,12 @@ class App(tk.Tk):
 
         view_menu = tk.Menu(menubar, tearoff=False)
         view_menu.add_checkbutton(label="Show Controls Panel", variable=self.controls_visible, command=self.on_toggle_controls)
-        view_menu.add_command(label="Compact Controls Width", command=self.on_compact_controls_width)
+        view_menu.add_command(label="Compact Controls Height", command=self.on_compact_controls_height)
+        view_menu.add_command(label="Give Height to Controls", command=self.on_give_height_to_controls)
         view_menu.add_separator()
-        view_menu.add_command(label="Maximize Files Pane", command=self.on_maximize_files)
-        view_menu.add_command(label="Maximize Groups Pane", command=self.on_maximize_groups)
+        view_menu.add_command(label="Maximize Files Section", command=self.on_maximize_files)
+        view_menu.add_command(label="Maximize Groups Section", command=self.on_maximize_groups)
+        view_menu.add_command(label="Maximize Controls Section", command=self.on_maximize_controls)
         menubar.add_cascade(label="View", menu=view_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -394,7 +495,6 @@ class App(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         container.rowconfigure(0, weight=1); container.columnconfigure(0, weight=1)
-        self.tv_groups.bind("<<TreeviewSelect>>", lambda e: self._on_group_selection_changed())
 
     def _build_controls(self, parent):
         nb = ttk.Notebook(parent)
@@ -492,51 +592,86 @@ class App(tk.Tk):
 
     # ---- View helpers ----
     def _set_initial_sashes(self):
+        """Set initial vertical sash positions with more height for Controls: Files ~35%, Groups ~25%, Controls ~40%."""
         try:
             self.update_idletasks()
-            total = self._paned.winfo_width() or self.winfo_width()
-            self._paned.sashpos(0, int(total*0.7))
+            total_h = self._paned.winfo_height() or self.winfo_height()
+            if total_h <= 0:
+                total_h = 800
+            pos0 = int(total_h * 0.35)  # Files / Groups divider
+            pos1 = int(total_h * 0.60)  # Groups / Controls divider -> Controls ~40%
+            self._paned.sashpos(0, pos0)
+            self._paned.sashpos(1, pos1)
         except Exception:
             pass
 
     def on_toggle_controls(self):
         vis = self.controls_visible.get()
         try:
-            if vis and self._controls not in self._paned.panes():
-                self._paned.add(self._controls, weight=3)
-            elif not vis and self._controls in self._paned.panes():
-                self._paned.forget(self._controls)
+            panes = self._paned.panes()
+            if vis and str(self._controls_frame) not in panes:
+                self._paned.add(self._controls_frame, weight=2)
+            elif not vis and str(self._controls_frame) in panes:
+                self._paned.forget(self._controls_frame)
         except Exception:
             pass
 
-    def on_compact_controls_width(self):
+    def on_compact_controls_height(self):
+        """Shrink the controls section to a compact height (~220 px)."""
         try:
             self.update_idletasks()
-            self._paned.sashpos(0, max(380, self._paned.winfo_width() - 360))
+            total_h = self._paned.winfo_height()
+            controls_h = 220
+            # place second sash so controls gets ~220px, but keep first sash above it
+            self._paned.sashpos(1, max(self._paned.sashpos(0)+200, total_h - controls_h))
         except Exception:
             pass
 
     def on_maximize_files(self):
+        """Give almost all height to the Files section."""
         try:
             self.update_idletasks()
-            self._paned.sashpos(0, self._paned.winfo_width() - 40)
+            total_h = self._paned.winfo_height()
+            self._paned.sashpos(0, total_h - 80)  # files big
+            self._paned.sashpos(1, total_h - 40)  # groups tiny, controls smaller
         except Exception:
             pass
 
     def on_maximize_groups(self):
+        """Give almost all height to the Groups section."""
         try:
-            # Favor groups vertically in left column
-            for child in self._paned.winfo_children():
-                left = child; break
-            for ch in left.winfo_children():
-                if isinstance(ch, ttk.Panedwindow):
-                    h = ch.winfo_height() or left.winfo_height()
-                    ch.sashpos(0, int(h*0.55))
-                    break
+            self.update_idletasks()
+            total_h = self._paned.winfo_height()
+            self._paned.sashpos(0, 120)        # files small
+            self._paned.sashpos(1, total_h - 40)  # groups big, controls tiny
+        except Exception:
+            pass
+
+    def on_maximize_controls(self):
+        """Give almost all height to the Controls section."""
+        try:
+            self.update_idletasks()
+            total_h = self._paned.winfo_height()
+            self._paned.sashpos(0, 120)  # files small
+            self._paned.sashpos(1, total_h - 10)  # controls big
         except Exception:
             pass
 
     # ---- Files/Groups ----
+    def on_give_height_to_controls(self):
+        """Reduce Files height and give it to Controls (≈35/25/40)."""
+        try:
+            self.update_idletasks()
+            total_h = self._paned.winfo_height() or self.winfo_height()
+            if total_h <= 0:
+                total_h = 800
+            pos0 = int(total_h * 0.35)
+            pos1 = int(total_h * 0.60)
+            self._paned.sashpos(0, pos0)
+            self._paned.sashpos(1, pos1)
+        except Exception:
+            pass
+
     def on_add_sw3_files(self):
         paths = filedialog.askopenfilenames(title="Add SW3/eegbin Files",
                                             filetypes=[("SW3/eegbin", "*.sw3 *.eegbin *.bin *.*")])
@@ -556,7 +691,7 @@ class App(tk.Tk):
                 traceback.print_exc(); messagebox.showwarning("Load error", f"Failed to load {path}\n{e}")
         if n:
             self._refresh_files_tv()
-            self._refresh_friendly_dropdowns()
+            self._refresh_display_mappings()
             self._set_status(f"Added {n} SW3 file(s).")
 
     def on_add_power_files(self):
@@ -574,7 +709,7 @@ class App(tk.Tk):
                 traceback.print_exc(); messagebox.showwarning("Load error", f"Failed to load {path}\n{e}")
         if n:
             self._refresh_files_tv()
-            self._refresh_friendly_dropdowns()
+            self._refresh_display_mappings()
             self._set_status(f"Added {n} power file(s).")
 
     def _meta_from_sweep(self, sweep) -> Dict[str, object]:
@@ -621,15 +756,15 @@ class App(tk.Tk):
             powc = sum(1 for fid in g.file_ids if self.files.get(fid, FileRecord("", "", "", "")).kind == "power")
             self.tv_groups.insert("", "end", iid=gid, values=(g.name, fmt_hhmmss(g.offset_s), sw3c, powc))
         self._refresh_group_select_list()
-        self._refresh_friendly_dropdowns()
+        self._refresh_display_mappings()
 
     def _refresh_group_select_list(self):
         self.lb_groups_select.delete(0, tk.END)
         for gid, g in self.groups.items():
             self.lb_groups_select.insert(tk.END, f"{gid}  {g.name}")
 
-    def _refresh_friendly_dropdowns(self):
-        # SW3 file dropdown (use labels; disambiguate if duplicates)
+    def _refresh_display_mappings(self):
+        # files (sw3)
         sw3_ids = [fid for fid, fr in self.files.items() if fr.kind=="sw3"]
         labels = [self.files[fid].label for fid in sw3_ids]
         counts = {}
@@ -642,8 +777,7 @@ class App(tk.Tk):
             self._sw3_display_to_id[disp] = fid
             sw3_display.append(disp)
         self.cb_ivt_sw3["values"] = sw3_display
-
-        # Group dropdowns
+        # groups
         self._group_display_to_id.clear()
         group_display = []
         name_counts = {}
@@ -674,7 +808,7 @@ class App(tk.Tk):
         if new:
             rec.label = new.strip()
             self._refresh_files_tv()
-            self._refresh_friendly_dropdowns()
+            self._refresh_display_mappings()
 
     def on_remove_files(self):
         sel = list(self.tv_files.selection())
@@ -757,6 +891,7 @@ class App(tk.Tk):
         self.groups[gid].offset_s = 0; self._refresh_groups_tv()
 
     def _ensure_group_selected_or_prompt(self) -> Optional[str]:
+        # Pick from groups table
         sel = self.tv_groups.selection()
         if sel: return sel[0]
         if not self.groups:
@@ -765,9 +900,6 @@ class App(tk.Tk):
         idx = simpledialog.askinteger("Select Group", "Enter group number:\n"+ "\n".join(f"{i+1}. {labels[i]}" for i in range(len(labels))),
                                       minvalue=1, maxvalue=len(labels), parent=self)
         return choices[idx-1] if idx else None
-
-    def _on_group_selection_changed(self):
-        pass
 
     # ---- Settings ----
     def on_set_power_columns(self):
@@ -804,7 +936,8 @@ class App(tk.Tk):
         ok=err=0
         for fid in targets:
             rec = self.files.get(fid)
-            if not rec: continue
+            if not rec:
+                continue
             try:
                 if rec.kind=="sw3":
                     with open(rec.path, "rb") as fd: buf = fd.read()
@@ -816,7 +949,7 @@ class App(tk.Tk):
                 ok += 1
             except Exception:
                 err += 1
-        self._refresh_files_tv(); self._refresh_groups_tv(); self._refresh_friendly_dropdowns()
+        self._refresh_files_tv(); self._refresh_display_mappings()
         self._set_status(f"Reloaded {ok} file(s){'; errors: '+str(err) if err else ''}.")
 
     # ---- Session I/O ----
@@ -834,6 +967,7 @@ class App(tk.Tk):
                 "associations": {k: list(v) for k,v in g.associations.items()},
             } for g in self.groups.values()],
             "controls": {
+                # common
                 "intensity_ema_span": self.intensity_ema_span.get(),
                 "power_ema_span": self.power_ema_span.get(),
                 "overlay_ema_span": self.overlay_ema_span.get(),
@@ -844,6 +978,7 @@ class App(tk.Tk):
                 "resample_seconds": self.resample_seconds.get(),
                 "normalize_to_1m": self.normalize_to_1m.get(),
                 "only_yaw_roll_zero": self.only_yaw_roll_zero.get(),
+                # per-analysis
                 "ivt_show_points": self.ivt_show_points.get(),
                 "ivt_show_ema": self.ivt_show_ema.get(),
                 "ivt_point_alpha": float(self.ivt_point_alpha.get()),
@@ -857,6 +992,7 @@ class App(tk.Tk):
                 "gdo_show_ema": self.gdo_show_ema.get(),
                 "gdo_point_alpha": float(self.gdo_point_alpha.get()),
                 "gdo_line_alpha": float(self.gdo_line_alpha.get()),
+                # selections
                 "source_mode": self.source_mode.get(),
                 "combine_group_sw3": self.combine_group_sw3.get(),
                 "ivt_sw3_display": self.ivt_sw3_display.get(),
@@ -886,6 +1022,7 @@ class App(tk.Tk):
         c = data.get("controls", {})
         def set_if(k,var): 
             if k in c: var.set(c[k])
+        # restore
         for k,var in [
             ("intensity_ema_span", self.intensity_ema_span),
             ("power_ema_span", self.power_ema_span),
@@ -918,15 +1055,30 @@ class App(tk.Tk):
             ("controls_visible", self.controls_visible),
         ]: set_if(k,var)
 
+        # refresh UI
         self._refresh_files_tv()
         self._refresh_groups_tv()
-        self._refresh_friendly_dropdowns()
+        self._refresh_display_mappings()
         self.on_toggle_controls()
         self._set_status(f"Loaded session from {path}")
 
+    # ---- Plot utilities ----
+    def _register_fig(self, cat: str, fig: plt.Figure):
+        self._figs.setdefault(cat, []).append(fig)
+
+    def _close_plots(self, cat: str, also: Tuple[str, ...]=()):
+        cats = (cat,) + tuple(also)
+        for c in cats:
+            figs = self._figs.get(c, [])
+            for f in figs:
+                try: plt.close(f)
+                except Exception: pass
+            self._figs[c] = []
+        # no status set here to avoid flicker
+
     # ---- Analysis: IVT ----
     def on_plot_intensity_vs_time(self):
-        # Close any old IVT plots to avoid clutter
+        # Replace any existing IVT plots
         self._close_plots('ivt')
 
         ema_span = int(self.intensity_ema_span.get())
@@ -1072,7 +1224,7 @@ class App(tk.Tk):
             df_sw = pd.DataFrame({"timestamp": t_sw, "intensity_ema": ema(y_sw, ema_int)})
 
             for pid in pow_ids:
-                pow_rec = self.files.get(pid); 
+                pow_rec = self.files.get(pid)
                 if not pow_rec or pow_rec.kind!="power": continue
                 try:
                     power_df, _ = self._load_power_csv_with_meta(pow_rec.path)
@@ -1084,7 +1236,7 @@ class App(tk.Tk):
                 if pdf.empty: continue
                 pdf["timestamp"] = pd.to_datetime(pdf["Timestamp"], unit="s")
                 pdf = pdf.set_index("timestamp").sort_index()
-                pdf = pdf.resample(f"{self.resample_seconds.get()}S")["W_Active"].mean().to_frame("power")
+                pdf = pdf.resample(f"{self.resample_seconds.get()}s")["W_Active"].mean().to_frame("power")
                 pdf["power_ema"] = pdf["power"].ewm(span=ema_pow, adjust=False).mean()
                 pdf = pdf.dropna(subset=["power_ema"]).reset_index()
                 pdf["timestamp"] = pdf["timestamp"].astype("int64") // 10**9
@@ -1104,7 +1256,7 @@ class App(tk.Tk):
         return aligned
 
     def on_analyze_group(self):
-        # Close old OVP plots
+        # Replace any existing OVP plot(s)
         self._close_plots('ovp')
 
         gdisp = self.ovp_group_display.get()
@@ -1122,28 +1274,25 @@ class App(tk.Tk):
         p_alpha  = float(self.ovp_point_alpha.get())
         l_alpha  = float(self.ovp_line_alpha.get())
 
-        # Unique pairs by IDs; consistent colors
-        pair_ids = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
-        base_colors = get_cmap_colors(len(pair_ids), "viridis")
-        fig = plt.figure()
-        ax1 = fig.add_subplot(111)
-        ax2 = ax1.twinx()
-
-        # common reference: earliest pair start for nicer side-by-side comparison
+        # Build paired colors per (sw3_id, power_id) to avoid duplicates; label with friendly names
+        pair_keys = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])) )
+        base_colors = get_cmap_colors(len(pair_keys), "viridis")
+        fig = plt.figure(); ax1 = fig.add_subplot(111); ax2 = ax1.twinx()
+        # global t0 so all pairs share the same time origin
         t0_global = aligned["timestamp_s"].min()
-
-        for i, (sid, pid) in enumerate(pair_ids):
-            dfp = aligned[(aligned["sw3_id"]==sid) & (aligned["power_id"]==pid)]
+        for i, (sw_id, pow_id) in enumerate(pair_keys):
+            dfp = aligned[(aligned["sw3_id"]==sw_id) & (aligned["power_id"]==pow_id)]
             if dfp.empty: continue
-            sw_label = str(dfp["sw3_label"].iloc[0]); pow_label = str(dfp["power_label"].iloc[0])
             th = (dfp["timestamp_s"] - t0_global) / 3600.0
             base = base_colors[i]
             c_int = darken(base, 0.35)   # darker for intensity
             c_pow = lighten(base, 0.60)  # lighter for power
+            sw_label = self.files[sw_id].label if sw_id in self.files else str(sw_id)
+            pw_label = self.files[pow_id].label if pow_id in self.files else str(pow_id)
             if show_int:
-                ax1.plot(th, dfp["intensity_ema"].to_numpy(), label=f"{sw_label} (optical)", alpha=l_alpha, color=c_int, linewidth=2)
+                ax1.plot(th, dfp["intensity_ema"].to_numpy(), label=f"{sw_label} (optical irradiance)", alpha=l_alpha, color=c_int, linewidth=2)
             if show_pow:
-                ax2.plot(th, dfp["power_ema"].to_numpy(), label=f"{pow_label} (power)", alpha=l_alpha, color=c_pow, linewidth=2)
+                ax2.plot(th, dfp["power_ema"].to_numpy(), label=f"{pw_label} (power)", alpha=l_alpha, color=c_pow, linewidth=2)
             if show_pts:
                 ax1.scatter(th, dfp["intensity_ema"].to_numpy(), s=8, alpha=p_alpha, color=c_int)
 
@@ -1153,14 +1302,20 @@ class App(tk.Tk):
         ax1.grid(True, linestyle="--", alpha=0.5)
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax2.legend(lines1+lines2, labels1+labels2, loc="best")
+        # Deduplicate legend entries by label
+        seen = {}
+        for h,lab in zip(lines1+lines2, labels1+labels2):
+            if lab not in seen:
+                seen[lab] = h
+        ax2.legend(list(seen.values()), list(seen.keys()), loc="best")
+        ax1.set_title(f"Optical irradiance and power vs time — {self.groups[gid].name}")
         fig.tight_layout()
         self._register_fig('ovp', fig)
         plt.show(block=False)
-        self._set_status(f"Analyzed group '{self.groups[gid].name}' — time series plotted (optical vs power).")
+        self._set_status(f"Analyzed group '{self.groups[gid].name}' — time series plotted.")
 
     def on_corr_and_scatter(self):
-        # Close old correlation windows
+        # Replace any existing correlation/scatter plots
         self._close_plots('corr')
 
         if self._aligned_cache is None or self._aligned_cache.empty:
@@ -1198,26 +1353,26 @@ class App(tk.Tk):
             axc.axvline(best_lag, linestyle=":")
             y_text = np.nanmax(ccf_vals) if np.isfinite(ccf_vals).any() else 0.0
             axc.text(best_lag, y_text, f"best lag={best_lag}s\nr={best_ccf:.3f}", ha="center", va="bottom")
-        axc.set_title("Cross‑correlation (optical vs power)")
-        axc.set_xlabel("Lag (s) [positive = optical lags power]"); axc.set_ylabel("Correlation")
+        axc.set_title("Cross‑correlation")
+        axc.set_xlabel("Lag (s) [positive = intensity lags power]"); axc.set_ylabel("Correlation")
         axc.grid(True, linestyle="--", alpha=0.5); fig_ccf.tight_layout()
         self._register_fig('corr', fig_ccf); plt.show(block=False)
 
         # 2) Scatter + regression
         slope, intercept, r_lin = linear_regression(aligned["power_ema"].to_numpy(), aligned["intensity_ema"].to_numpy())
         fig_sc = plt.figure(); axs = fig_sc.add_subplot(111)
-        # color per unique pair by IDs
-        pair_ids = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
-        base_colors = get_cmap_colors(len(pair_ids), "viridis")
-        for i, (sid, pid) in enumerate(pair_ids):
-            dfp = aligned[(aligned["sw3_id"]==sid) & (aligned["power_id"]==pid)]
-            sw_label = str(dfp["sw3_label"].iloc[0]); pow_label = str(dfp["power_label"].iloc[0])
-            axs.scatter(dfp["power_ema"], dfp["intensity_ema"], s=10, alpha=0.25, label=f"{sw_label} vs {pow_label}", color=base_colors[i])
+        # color per pair
+        pair_keys = sorted(set(zip(aligned["sw3_id"], aligned["power_id"])))
+        base_colors = get_cmap_colors(len(pair_keys), "viridis")
+        for i, (sw_id, pow_id) in enumerate(pair_keys):
+            dfp = aligned[(aligned["sw3_id"]==sw_id) & (aligned["power_id"]==pow_id)]
+            sw_label = self.files[sw_id].label if sw_id in self.files else str(sw_id)
+            pw_label = self.files[pow_id].label if pow_id in self.files else str(pow_id)
+            axs.scatter(dfp["power_ema"], dfp["intensity_ema"], s=10, alpha=0.25, label=f"{sw_label} vs {pw_label}", color=base_colors[i])
         if np.isfinite(slope) and np.isfinite(intercept):
             xs = np.linspace(aligned["power_ema"].min(), aligned["power_ema"].max(), 200)
             ys = slope*xs + intercept
             axs.plot(xs, ys, linewidth=2, alpha=0.9, label=f"Fit: y={slope:.3f}x+{intercept:.3f}  r={r_lin:.3f}")
-        axs.set_title("Optical vs Power — Scatter + Fit")
         axs.set_xlabel("Power (W) [EMA]"); axs.set_ylabel("Intensity (µW/cm²) [EMA]"); axs.grid(True, linestyle="--", alpha=0.5)
         axs.legend(); fig_sc.tight_layout(); self._register_fig('corr', fig_sc); plt.show(block=False)
 
@@ -1236,7 +1391,7 @@ class App(tk.Tk):
 
     # ---- Analysis: Group Decay Overlay ----
     def on_plot_group_decay(self, selected_only: bool):
-        # Auto-close prior GDO figs
+        # Replace any existing GDO plots
         self._close_plots('gdo')
 
         ema_span = int(self.overlay_ema_span.get())
@@ -1297,27 +1452,11 @@ class App(tk.Tk):
         ax.grid(True, linestyle="--", alpha=0.5); ax.legend()
         fig.tight_layout(); self._register_fig('gdo', fig); plt.show(block=False)
 
-    # ---- Plot utils ----
-    def _register_fig(self, cat: str, fig: plt.Figure):
-        self._figs.setdefault(cat, []).append(fig)
-
-    def _close_plots(self, cat: str, also: Tuple[str, ...]=()):
-        cats = (cat,) + tuple(also)
-        for c in cats:
-            figs = self._figs.get(c, [])
-            for f in figs:
-                try: plt.close(f)
-                except Exception: pass
-            self._figs[c] = []
-        # status update (non-intrusive; useful when called from buttons)
-        if also:
-            self._set_status(f"Closed {', '.join(cats)} plot windows.")
-
+    # ---- Plot helpers ----
     def _select_all_groups(self):
         self.lb_groups_select.selection_set(0, tk.END)
 
     def on_save_last_figure(self):
-        # Save the last-created figure across categories
         for cat in ("ivt","ovp","gdo","corr"):
             if self._figs.get(cat):
                 last_fig = self._figs[cat][-1]
@@ -1350,10 +1489,6 @@ class AssociationDialog(tk.Toplevel):
         self.title(f"Associations for '{group.name}'"); self.resizable(True, True)
         self.group = group; self.updated = False
 
-        # Build ID→label helpers
-        self.sw3_id_to_label = {fid: fr.label for fid, fr in sw3_list}
-        self.pow_id_to_label = {fid: fr.label for fid, fr in power_list}
-
         pane = ttk.Panedwindow(self, orient=tk.HORIZONTAL); pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         left = ttk.Frame(pane); pane.add(left, weight=1)
         right = ttk.Frame(pane); pane.add(right, weight=1)
@@ -1373,17 +1508,11 @@ class AssociationDialog(tk.Toplevel):
         ttk.Button(btns, text="Remove mapping", command=self._remove_mapping).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=3)
 
-        # Mapping preview (always shows ALL mappings)
-        self.tv_map = ttk.Treeview(self, columns=("sw3", "powers"), show="headings", height=8)
-        self.tv_map.heading("sw3", text="SW3 (friendly)")
-        self.tv_map.heading("powers", text="Power (friendly)")
-        self.tv_map.column("sw3", stretch=True, width=260)
-        self.tv_map.column("powers", stretch=True, width=480)
-        self.tv_map.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self._refresh_mapping()
-
-        # Help
-        ttk.Label(self, text="Tip: You can map the **same power** to multiple SW3 files. Mapping never removes existing pairs unless you click “Remove mapping”.").pack(anchor="w", padx=8, pady=(0,6))
+        self.tv_map = ttk.Treeview(self, columns=("sw3", "powers"), show="headings", height=6)
+        self.tv_map.heading("sw3", text="SW3"); self.tv_map.heading("powers", text="Power")
+        self.tv_map.column("sw3", stretch=True, width=260); self.tv_map.column("powers", stretch=True, width=480)
+        self.tv_map.pack(fill=tk.BOTH, expand=True, padx=6, pady=6); self._refresh_mapping()
+        self.lb_sw3.bind("<<ListboxSelect>>", lambda e: self._refresh_mapping())
 
     def _map_selected(self):
         idx_sw = self.lb_sw3.curselection(); idx_pw = self.lb_pow.curselection()
@@ -1405,12 +1534,21 @@ class AssociationDialog(tk.Toplevel):
         self.updated = True; self._refresh_mapping()
 
     def _refresh_mapping(self):
-        for item in self.tv_map.get_children(): self.tv_map.delete(item)
-        # Always show all mappings
+        for item in self.tv_map.get_children():
+            self.tv_map.delete(item)
+        # Always show FULL mapping with friendly labels so it never looks like it was substituted
         for sw_id, pset in sorted(self.group.associations.items()):
-            sw_name = f"{self.sw3_id_to_label.get(sw_id, sw_id)} ({sw_id})"
-            pow_names = [self.pow_id_to_label.get(pid, pid) for pid in sorted(pset)]
-            self.tv_map.insert("", "end", values=(sw_name, ", ".join(pow_names)))
+            try:
+                sw_label = self.master.files[sw_id].label
+            except Exception:
+                sw_label = sw_id
+            power_labels = []
+            for pid in sorted(list(pset)):
+                try:
+                    power_labels.append(self.master.files[pid].label)
+                except Exception:
+                    power_labels.append(pid)
+            self.tv_map.insert("", "end", values=(f"{sw_label} ({sw_id})", ", ".join(power_labels)))
 
 # ---- Entrypoint ----
 
