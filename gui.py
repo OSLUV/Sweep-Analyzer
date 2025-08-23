@@ -1116,6 +1116,52 @@ class App(tk.Tk):
             out.sort(key=lambda x: x[0])
             return out
 
+        def rows_from_sw3_bands(fid: str):
+            """
+            Returns three time series (lists of (timestamp, uW/cm^2)):
+              - total (existing integral_result path, with 1 m normalization if selected)
+              - band_200_300 (integrated 200–300 nm)
+              - band_200_230 (integrated 200–230 nm)
+            """
+            rec = self.files.get(fid)
+            if not rec or rec.kind != "sw3": return ([], [], [])
+            try:
+                with open(rec.path, "rb") as fd: buf = fd.read()
+                ensure_eegbin_imported()
+                try: sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
+                except Exception: sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
+            except Exception as e:
+                messagebox.showwarning("Load error", f"Failed to load {rec.path}\n{e}"); return ([], [], [])
+
+            tot, b200_300, b200_230 = [], [], []
+            for r in getattr(sweep, "rows", []):
+                if hasattr(r, "valid") and not r.valid: continue
+                if only_zero and not (getattr(r.coords,"yaw_deg",None)==0 and getattr(r.coords,"roll_deg",None)==0): continue
+                if getattr(r, "timestamp", None) is None: continue
+                ts = float(r.timestamp)
+                # distance normalization factor (to 1 m) if enabled
+                scale = 1.0
+                if norm_1m:
+                    dist_m = float(getattr(r.coords, "lin_mm", 0.0) or 0.0)/1000.0
+                    if dist_m > 0:
+                        scale = (dist_m**2)
+                # total (existing: integral_result)
+                I_wm2 = float(getattr(r.capture, "integral_result", 0.0) or 0.0) * scale
+                tot.append((ts, I_wm2 * 100.0))  # W/m^2 -> uW/cm^2
+                # band integrations if spectrum is present
+                spec = getattr(r.capture, "spectral_result", None)
+                if spec and len(spec) > 3:
+                    try:
+                        i_200_300 = float(sweep.integrate_spectral(spec, 200.0, 300.0)) * scale
+                        i_200_230 = float(sweep.integrate_spectral(spec, 200.0, 230.0)) * scale
+                        b200_300.append((ts, i_200_300 * 100.0))
+                        b200_230.append((ts, i_200_230 * 100.0))
+                    except Exception:
+                        # If integration fails on a row, just skip that row for bands.
+                        pass
+            tot.sort(key=lambda x: x[0]); b200_300.sort(key=lambda x: x[0]); b200_230.sort(key=lambda x: x[0])
+            return (tot, b200_300, b200_230)
+
         fig = plt.figure(); ax = fig.add_subplot(111)
 
         if mode == "file":
@@ -1123,7 +1169,7 @@ class App(tk.Tk):
             fid = self._display_to_sw3_id(disp)
             if not fid:
                 messagebox.showinfo("Plot", "Select an SW3 file."); return
-            rows = rows_from_sw3(fid)
+            rows, rows_b20300, rows_b20230 = rows_from_sw3_bands(fid)
 
             # Apply per-action trim (seconds) relative to series start
             if rows:
@@ -1139,6 +1185,15 @@ class App(tk.Tk):
                             tmin, tmax = win
                             mask = (t >= tmin) & (t <= tmax)
                             t, y = t[mask], y[mask]
+                            # Apply same clipping to band series
+                            if 'rows_b20300' in locals() and rows_b20300:
+                                tb, yb = np.array([r[0] for r in rows_b20300]), np.array([r[1] for r in rows_b20300])
+                                mb = (tb >= tmin) & (tb <= tmax)
+                                rows_b20300 = list(zip(tb[mb], yb[mb]))
+                            if 'rows_b20230' in locals() and rows_b20230:
+                                tc, yc = np.array([r[0] for r in rows_b20230]), np.array([r[1] for r in rows_b20230])
+                                mc = (tc >= tmin) & (tc <= tmax)
+                                rows_b20230 = list(zip(tc[mc], yc[mc]))
                         break
             else:
                 messagebox.showinfo("Plot", "No rows after filtering."); return
@@ -1149,6 +1204,30 @@ class App(tk.Tk):
             th = (t - t[0]) / 3600.0
             if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{self.files[fid].label} (raw)")
             if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA")
+            # --- Add 200–300 nm and 200–230 nm lines ---
+            if 'rows_b20300' in locals() and rows_b20300:
+                t2 = np.array([r[0] for r in rows_b20300]); y2 = np.array([r[1] for r in rows_b20300])
+                # Apply time trims relative to this series' start
+                if t2.size:
+                    t2_0 = t2[0]
+                    if trim_start>0: m2 = (t2 - t2_0) >= trim_start; t2,y2 = t2[m2], y2[m2]
+                    if trim_end>0:   t2end = t2[-1]; m2 = (t2end - t2) >= trim_end; t2,y2 = t2[m2], y2[m2]
+                if t2.size:
+                    y2_ema = ema(y2, ema_span)
+                    th2 = (t2 - t[0]) / 3600.0  # align to main series start for readability
+                    if show_line: ax.plot(th2, y2_ema, linewidth=2, alpha=l_alpha, linestyle="--",
+                                          label=f"{self.files[fid].label} 200–300 nm EMA")
+            if 'rows_b20230' in locals() and rows_b20230:
+                t3 = np.array([r[0] for r in rows_b20230]); y3 = np.array([r[1] for r in rows_b20230])
+                if t3.size:
+                    t3_0 = t3[0]
+                    if trim_start>0: m3 = (t3 - t3_0) >= trim_start; t3,y3 = t3[m3], y3[m3]
+                    if trim_end>0:   t3end = t3[-1]; m3 = (t3end - t3) >= trim_end; t3,y3 = t3[m3], y3[m3]
+                if t3.size:
+                    y3_ema = ema(y3, ema_span)
+                    th3 = (t3 - t[0]) / 3600.0
+                    if show_line: ax.plot(th3, y3_ema, linewidth=2, alpha=l_alpha, linestyle=":",
+                                          label=f"{self.files[fid].label} 200–230 nm EMA")
         else:
             gdisp = self.ivt_group_display.get()
             gid = self._display_to_group_id(gdisp)
@@ -1159,24 +1238,44 @@ class App(tk.Tk):
             if not sw3_ids: messagebox.showinfo("Plot", "No SW3 files in this group."); return
             colors = get_cmap_colors(len(sw3_ids), "viridis")
             if self.combine_group_sw3.get():
-                all_rows = []
+                all_rows = []; all_b20300 = []; all_b20230 = []
                 for fid in sw3_ids:
-                    all_rows.extend(rows_from_sw3(fid))
+                    r0, r20300, r20230 = rows_from_sw3_bands(fid)
+                    all_rows.extend(r0); all_b20300.extend(r20300); all_b20230.extend(r20230)
                 if win is not None and all_rows:
                     tmin, tmax = win
                     all_rows = self._filter_rows_by_window(all_rows, tmin, tmax)
+                    if all_b20300: all_b20300 = self._filter_rows_by_window(all_b20300, tmin, tmax)
+                    if all_b20230: all_b20230 = self._filter_rows_by_window(all_b20230, tmin, tmax)
                 if not all_rows: messagebox.showinfo("Plot", "No rows after filtering."); return
                 all_rows.sort(key=lambda x: x[0])
                 t = np.array([r[0] for r in all_rows]); y = np.array([r[1] for r in all_rows])
                 y_ema = ema(y, ema_span); th = (t - t[0]) / 3600.0
                 if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{g.name} (raw)")
                 if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{g.name} EMA")
+                # Group-combined band lines (same color; different styles)
+                if 'all_b20300' in locals() and all_b20300:
+                    all_b20300.sort(key=lambda x:x[0])
+                    t2 = np.array([r[0] for r in all_b20300]); y2 = np.array([r[1] for r in all_b20300])
+                    if t2.size:
+                        y2_ema = ema(y2, ema_span); th2 = (t2 - t[0]) / 3600.0
+                        if show_line: ax.plot(th2, y2_ema, linewidth=2, alpha=l_alpha, linestyle="--",
+                                          label=f"{g.name} 200–300 nm EMA")
+                if 'all_b20230' in locals() and all_b20230:
+                    all_b20230.sort(key=lambda x:x[0])
+                    t3 = np.array([r[0] for r in all_b20230]); y3 = np.array([r[1] for r in all_b20230])
+                    if t3.size:
+                        y3_ema = ema(y3, ema_span); th3 = (t3 - t[0]) / 3600.0
+                        if show_line: ax.plot(th3, y3_ema, linewidth=2, alpha=l_alpha, linestyle=":",
+                                          label=f"{g.name} 200–230 nm EMA")
             else:
                 for i, fid in enumerate(sw3_ids):
-                    rows = rows_from_sw3(fid)
+                    rows, rows_b20300, rows_b20230 = rows_from_sw3_bands(fid)
                     if win is not None and rows:
                         tmin, tmax = win
                         rows = self._filter_rows_by_window(rows, tmin, tmax)
+                    if rows_b20300: rows_b20300 = self._filter_rows_by_window(rows_b20300, tmin, tmax)
+                    if rows_b20230: rows_b20230 = self._filter_rows_by_window(rows_b20230, tmin, tmax)
                     if not rows: continue
                     t = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows])
                     y_ema = ema(y, ema_span); th = (t - t[0]) / 3600.0
@@ -1184,6 +1283,21 @@ class App(tk.Tk):
                     if show_pts: ax.scatter(th, y, s=8, alpha=p_alpha, label=f"{self.files[fid].label} (raw)", color=c)
                     if show_line: ax.plot(th, y_ema, linewidth=2, alpha=l_alpha, label=f"{self.files[fid].label} EMA", color=c)
 
+                    # Per-file band lines (same color; dashed/dotted)
+                    if 'rows_b20300' in locals() and rows_b20300:
+                        rows_b20300.sort(key=lambda x:x[0])
+                        t2 = np.array([r[0] for r in rows_b20300]); y2 = np.array([r[1] for r in rows_b20300])
+                        if t2.size:
+                            y2_ema = ema(y2, ema_span); th2 = (t2 - t[0]) / 3600.0
+                            if show_line: ax.plot(th2, y2_ema, linewidth=2, alpha=l_alpha, linestyle="--",
+                                                  label=f"{self.files[fid].label} 200–300 nm EMA", color=c)
+                    if 'rows_b20230' in locals() and rows_b20230:
+                        rows_b20230.sort(key=lambda x:x[0])
+                        t3 = np.array([r[0] for r in rows_b20230]); y3 = np.array([r[1] for r in rows_b20230])
+                        if t3.size:
+                            y3_ema = ema(y3, ema_span); th3 = (t3 - t[0]) / 3600.0
+                            if show_line: ax.plot(th3, y3_ema, linewidth=2, alpha=l_alpha, linestyle=":",
+                                                  label=f"{self.files[fid].label} 200–230 nm EMA", color=c)
         ax.set_title("Measured Light Intensity vs Time")
         ax.set_xlabel("Time since start (hours)")
         ax.set_ylabel("Normalized Intensity at 1 m (µW/cm²)")
