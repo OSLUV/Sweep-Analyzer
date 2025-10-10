@@ -503,7 +503,7 @@ class App(tk.Tk):
         r3 = ttk.Frame(tab_ivt); r3.pack(fill=tk.X, padx=6, pady=6)
         ttk.Button(r3, text="Plot", command=self.on_plot_intensity_vs_time).pack(side=tk.LEFT, padx=3)
         ttk.Button(r3, text="Save Figure…", command=self.on_save_last_figure).pack(side=tk.LEFT, padx=3)
-        ttk.Button(r3, text="Close IVT Plots", command=lambda: self._close_plots('ivt')).pack(side=tk.LEFT, padx=10)
+        ttk.Button(r3, text="Close IVT/Spectrum Plots", command=lambda: self._close_plots('ivt', also=('spec',))).pack(side=tk.LEFT, padx=10)
         ttk.Label(tab_ivt, text="Trim accepts seconds (e.g., 90) or HH:MM:SS (e.g., 00:01:30).").pack(anchor="w", padx=10)
 
         # ---- Optics vs Power ----
@@ -1191,6 +1191,304 @@ class App(tk.Tk):
         ax.legend()
         fig.tight_layout()
         self._register_fig('ivt', fig)
+        self._attach_wavelength_inspector_to_ivt(fig)
+        plt.show(block=False)
+
+    # ------------------------------------------------------------------
+    # Wavelength (Spectrum) inspector for IVT plots
+    # ------------------------------------------------------------------
+    def _build_ivt_series_data_for_current_selection(self):
+        """
+        Recompute the data series (x in hours, row refs, and sweep refs)
+        that are currently represented in the latest Intensity-vs-Time plot,
+        based on the same controls / trims as the plot uses.
+        Returns: list of dicts with keys:
+            - label: str
+            - t_hours: np.ndarray
+            - t_seconds: np.ndarray (epoch seconds)
+            - rows: List[eegbin.GoniometerRow]
+            - sweeps: List[eegbin.LampScan] (parallel to rows)
+        """
+        ensure_eegbin_imported()
+        mode = self.source_mode.get()
+        trim_start = int(self.trim_start_s.get())
+        trim_end   = int(self.trim_end_s.get())
+        only_zero  = self.only_yaw_roll_zero.get()
+        norm_1m    = self.normalize_to_1m.get()
+
+        def load_sweep_for_fid(fid: str):
+            rec = self.files.get(fid)
+            if not rec or rec.kind != "sw3":
+                return None
+            try:
+                with open(rec.path, "rb") as fd:
+                    buf = fd.read()
+                try:
+                    sweep = eegbin.load_eegbin3(buf, from_path=rec.path)
+                except Exception:
+                    sweep = eegbin.load_eegbin2(buf, from_path=rec.path)
+                return sweep
+            except Exception as e:
+                try:
+                    messagebox.showwarning("Load error", f"Failed to load {rec.path}\\n{e}")
+                except Exception:
+                    pass
+                return None
+
+        def rows_for_sweep(fid: str, sweep):
+            rows = []
+            for r in getattr(sweep, "rows", []):
+                if hasattr(r, "valid") and not r.valid:
+                    continue
+                if only_zero and not (getattr(r.coords, "yaw_deg", None) == 0 and getattr(r.coords, "roll_deg", None) == 0):
+                    continue
+                if getattr(r, "timestamp", None) is None:
+                    continue
+                I_wm2 = float(getattr(r.capture, "integral_result", 0.0) or 0.0)
+                if norm_1m:
+                    dist_m = float(getattr(r.coords, "lin_mm", 0.0) or 0.0) / 1000.0
+                    if dist_m > 0:
+                        I_wm2 = I_wm2 * (dist_m ** 2)
+                I_uW_cm2 = I_wm2 * 100.0
+                rows.append((float(r.timestamp), I_uW_cm2, r))
+            # Apply control-level trims
+            if rows:
+                tmin = rows[0][0] + max(0, float(trim_start))
+                tmax = rows[-1][0] - max(0, float(trim_end))
+                rows = [(t, y, r) for (t, y, r) in rows if (t >= tmin and t <= tmax)]
+            # Also apply group-level trims if the file belongs to any trimmed group
+            for g in self.groups.values():
+                if fid in g.file_ids:
+                    win = self._group_time_window(g)
+                    if win is not None and rows:
+                        tw0, tw1 = win
+                        rows = [(t, y, r) for (t, y, r) in rows if (t >= tw0 and t <= tw1)]
+                    break
+            return rows
+
+        series = []
+        if mode == "file":
+            disp = self.ivt_sw3_display.get()
+            fid = self._display_to_sw3_id(disp)
+            if not fid or fid not in self.files:
+                return []
+            sweep = load_sweep_for_fid(fid)
+            rows = rows_for_sweep(fid, sweep) if sweep is not None else []
+            if not rows:
+                return []
+            t = np.array([rr[0] for rr in rows], dtype=float)
+            y = np.array([rr[1] for rr in rows], dtype=float)
+            t0 = t[0]
+            th = (t - t0) / 3600.0
+            series.append({
+                "label": self.files[fid].label,
+                "t_hours": th,
+                "t_seconds": t,
+                "rows": [rr[2] for rr in rows],
+                "sweeps": [sweep for _ in rows],
+            })
+        else:
+            gdisp = self.ivt_group_display.get()
+            gid = self._display_to_group_id(gdisp)
+            if not gid or gid not in self.groups:
+                return []
+            g = self.groups[gid]
+            sw3_ids = [fid for fid in g.file_ids if self.files.get(fid) and self.files[fid].kind == "sw3"]
+            if not sw3_ids:
+                return []
+            if self.combine_group_sw3.get():
+                # Combined series across all SW3 in the group
+                combined = []
+                per_row_sweep = []
+                for fid in sw3_ids:
+                    sweep = load_sweep_for_fid(fid)
+                    if sweep is None:
+                        continue
+                    rows = rows_for_sweep(fid, sweep)
+                    combined.extend(rows)
+                    per_row_sweep.extend([sweep for _ in rows])
+                if not combined:
+                    return []
+                combined.sort(key=lambda z: z[0])  # by timestamp
+                t = np.array([rr[0] for rr in combined], dtype=float)
+                t0 = t[0]
+                th = (t - t0) / 3600.0
+                series.append({
+                    "label": g.name + " (combined)",
+                    "t_hours": th,
+                    "t_seconds": t,
+                    "rows": [rr[2] for rr in combined],
+                    "sweeps": per_row_sweep,
+                })
+            else:
+                # Separate series, one per SW3 file
+                for fid in sw3_ids:
+                    sweep = load_sweep_for_fid(fid)
+                    if sweep is None:
+                        continue
+                    rows = rows_for_sweep(fid, sweep)
+                    if not rows:
+                        continue
+                    t = np.array([rr[0] for rr in rows], dtype=float)
+                    t0 = t[0]
+                    th = (t - t0) / 3600.0
+                    series.append({
+                        "label": self.files[fid].label,
+                        "t_hours": th,
+                        "t_seconds": t,
+                        "rows": [rr[2] for rr in rows],
+                        "sweeps": [sweep for _ in rows],
+                    })
+        return series
+
+    def _attach_wavelength_inspector_to_ivt(self, fig: plt.Figure):
+        """
+        Given a freshly created Intensity vs Time Matplotlib figure, install:
+          • pick handler for scatter points and EMA lines
+          • click handler for free‑space clicks
+        so that clicking shows the nearest spectrum (Wavelength vs Intensity) in its own window.
+        """
+        try:
+            ax = fig.axes[0]
+        except Exception:
+            return
+        series = self._build_ivt_series_data_for_current_selection()
+        if not series:
+            return
+
+        # Stash series on the axes for easy access by generic click handler
+        ax._ivt_series = series
+
+        # Make existing artists pickable and tag them with series meta.
+        # Try to match artists to series by label; fall back to order.
+        # We only need a reference for nearest search; free-space handler uses ax._ivt_series.
+        label_to_series = {s["label"]: s for s in series}
+        for artist in ax.lines + ax.collections:
+            try:
+                lbl = artist.get_label()
+            except Exception:
+                lbl = None
+            sdict = label_to_series.get(lbl)
+            if sdict is None and series:
+                # Fall back to first series if labels don't match (robustness)
+                sdict = series[0]
+            try:
+                artist.set_picker(True)
+            except Exception:
+                pass
+            setattr(artist, "_ivt_series_meta", sdict)
+
+        def nearest_index(sdict, xh):
+            """Return index of row in sdict whose t_hours is closest to xh."""
+            th = sdict["t_hours"]
+            if not isinstance(th, np.ndarray): th = np.asarray(th, dtype=float)
+            if th.size == 0:
+                return None
+            idx = int(np.argmin(np.abs(th - float(xh))))
+            return idx
+
+        def show_for_index(sdict, idx, reason="click"):
+            if idx is None:
+                return
+            rows = sdict["rows"]
+            sweeps = sdict["sweeps"]
+            if idx < 0 or idx >= len(rows):
+                return
+            row = rows[idx]
+            sweep = sweeps[idx]
+            # If no spectral data at this row, pick nearest in same sweep that has one
+            if (getattr(row.capture, "spectral_result", None) is None) or (getattr(row, "flags", 0) & getattr(eegbin.Flags, "NO_SPECTRAL").value):
+                # nearest by timestamp in this sweep
+                tgt = float(getattr(row, "timestamp", 0.0) or 0.0)
+                best = None; best_dt = float("inf")
+                for r2 in getattr(sweep, "rows", []):
+                    if r2.capture and r2.capture.spectral_result:
+                        dt = abs(float(getattr(r2, "timestamp", 0.0) or 0.0) - tgt)
+                        if dt < best_dt:
+                            best_dt = dt; best = r2
+                if best is not None:
+                    row = best
+            self._show_wavelength_plot(row, sweep, sdict["label"])
+
+        def on_pick(event):
+            artist = getattr(event, "artist", None)
+            sdict = getattr(artist, "_ivt_series_meta", None)
+            if sdict is None:
+                return
+            # Clicking a scatter point yields indices; clicking a line yields indices or none.
+            try:
+                ind = event.ind
+            except Exception:
+                ind = None
+            if ind is not None and len(ind) >= 1 and hasattr(artist, "get_offsets"):
+                # PathCollection (scatter)
+                idx = int(ind[0])
+                show_for_index(sdict, idx, reason="pick-point")
+            else:
+                # Line or other artist -> choose nearest actual data point by x
+                me = getattr(event, "mouseevent", None)
+                if me is None or me.xdata is None:
+                    return
+                idx = nearest_index(sdict, me.xdata)
+                show_for_index(sdict, idx, reason="pick-line")
+
+        def on_click(event):
+            # plain click in free space on the IVT axes -> nearest across all series
+            if getattr(event, "inaxes", None) is not ax:
+                return
+            if event.xdata is None:
+                return
+            xh = float(event.xdata)
+            best = (None, None, float("inf"))  # (sdict, idx, dx)
+            for sdict in getattr(ax, "_ivt_series", []):
+                idx = nearest_index(sdict, xh)
+                if idx is None:
+                    continue
+                dx = abs(sdict["t_hours"][idx] - xh)
+                if dx < best[2]:
+                    best = (sdict, idx, dx)
+            if best[0] is not None:
+                show_for_index(best[0], best[1], reason="click")
+
+        fig.canvas.mpl_connect("pick_event", on_pick)
+        fig.canvas.mpl_connect("button_press_event", on_click)
+
+    def _show_wavelength_plot(self, row, sweep, src_label: str):
+        """Open a new figure showing Wavelength (nm) vs Spectral Intensity for the given row."""
+        if row is None or sweep is None:
+            messagebox.showinfo("Spectrum", "No spectral data available for this point.")
+            return
+        spectral = getattr(row.capture, "spectral_result", None)
+        if not spectral:
+            messagebox.showinfo("Spectrum", "No spectral data available for this point.")
+            return
+        try:
+            wvls = np.asarray(getattr(sweep, "spectral_wavelengths", []), dtype=float)
+            vals = np.asarray(list(spectral), dtype=float)
+        except Exception:
+            messagebox.showinfo("Spectrum", "Unable to read spectral data for this point.")
+            return
+
+        # Optional 1m normalization (inverse-square)
+        if self.normalize_to_1m.get():
+            dist_m = float(getattr(row.coords, "lin_mm", 0.0) or 0.0) / 1000.0
+            if dist_m > 0:
+                vals = vals * (dist_m ** 2)
+
+        units = getattr(sweep, "spectral_units", "a.u.")
+        rr = getattr(row, "coords", None)
+        yaw = getattr(rr, "yaw_deg", None); roll = getattr(rr, "roll_deg", None)
+        ts  = float(getattr(row, "timestamp", 0.0) or 0.0)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        ax.plot(wvls, vals, linewidth=1.5)
+        ax.set_title(f"Spectrum @ t={ts:.0f} (yaw {yaw}, roll {roll}) — {src_label}")
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel(f"Spectral Intensity ({units}" + (", scaled to 1 m" if self.normalize_to_1m.get() else "") + ")")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        fig.tight_layout()
+        self._register_fig('spec', fig)
         plt.show(block=False)
 
     # ------------------------------------------------------------------
