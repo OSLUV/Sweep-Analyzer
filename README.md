@@ -23,6 +23,11 @@ Includes grouping, many‑to‑many associations, global **trimming (HH:MM:SS)**
   - classify runs as `Complete Dataset`, `Main Scan`, `Burn-in Scan`, etc.
   - pick duplicate segment instances explicitly (latest or selected-run auto-pick)
   - attach lamp and axes image assets for downstream report generation
+  - edit metadata and section notes in a dedicated `Metadata` tab
+  - review report analyses in a dedicated `Preview` tab with zoom/pan controls
+  - use spectral popout windows (`Open Spectral Table`, `Open Spectral Linear`, `Open Spectral Log`)
+  - use optical-power integration presets (`200-230`, `200-300`) and exposure weighting (`IEC` default)
+  - rely on vendored IES/IEC weighting tables in `reporting_data/` (no external table dependency)
 
 ## Docs
 - [User Guide](docs/USER_GUIDE.md)
@@ -66,15 +71,15 @@ Report Builder fixture validation (Aerolamp):
 
 ## Continuous Integration (GitHub Actions)
 
-This repo includes a cross‑platform workflow to build on **Ubuntu, Windows, and macOS (Intel & Apple Silicon)** and attach artifacts to releases when you push a tag starting with `v` (e.g. `v2.0.0`).  
+This repo includes a cross‑platform workflow to build on **Ubuntu, Windows, and macOS (Intel & Apple Silicon)** and attach artifacts to releases when you push a tag starting with `v` (e.g. `v3.0.0`).  
 See [`.github/workflows/build.yml`](.github/workflows/build.yml) for details.
 
 ### Usage
 1. Commit and push to `main` to build and upload CI artifacts.
 2. Create a version tag to publish a release:
    ```bash
-   git tag v2.0.0
-   git push origin v2.0.0
+   git tag v3.0.0
+   git push origin v3.0.0
    ```
 
 ### macOS Gatekeeper

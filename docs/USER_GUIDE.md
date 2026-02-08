@@ -30,11 +30,26 @@
    - loose spectrometer scan
    - tight spectrometer scan
 8. Use `Auto Latest` or `Auto Selected Scan` as a baseline, then override manually as needed.
+9. Open `Metadata`:
+   - fill report identity, article details, electrical setup, and PSU details,
+   - add section notes used in downstream report generation.
+10. Open `Preview`:
+   - click `Refresh Previews` to recompute all sections,
+   - choose exposure weighting (`IEC` defaults at startup),
+   - choose optical power integration (`200-230`, `200-300`, custom band, or `Full spectrum` mode),
+   - inspect `Overview`, `Pattern`, `Warm-Up`, `Burn-In`, `Spectral`, `Exposure`, `Roll`, `R²`, and `Electrical`.
+11. In the `Spectral` preview, use:
+   - toolbar pan/zoom controls,
+   - `Open Table`, `Open Linear`, and `Open Log` to open dedicated popout windows.
 
 **Warm-up Selection Rule**
 - Warm-up auto-selection prefers the latest approximately 1-hour warm-up segment.
 - If no approximately 1-hour segment exists, it falls back to the latest available warm-up segment.
 - This supports workflows where a full seasoned run and a short verification run exist together.
+
+**Weighting Tables**
+- Spectral exposure weighting uses vendored IES/IEC tables located in `reporting_data/`.
+- This removes runtime coupling to external OpenGoniometer table files.
 
 **Intensity vs Time (IVT)**
 - Choose a single SW3 file or a group.

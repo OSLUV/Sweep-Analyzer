@@ -12,6 +12,8 @@ Current tests cover:
 - dataset smoke check for Open Excimer folder presence
 - report phase tagging and scan-role inference heuristics
 - warm-up segment auto-selection behavior for duplicate/partial runs
+- spectral weighting log-interpolation behavior (`tests/test_weighting_interpolation.py`)
+- vendored IES/IEC weighting table availability and density (`tests/test_vendored_weight_tables.py`)
 
 Run only report-tagging regressions:
 
