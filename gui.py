@@ -555,6 +555,164 @@ def darken(color, amount=0.35):
 
 # Unit conversion: 1 W/m^2 = 100 µW/cm^2
 WM2_TO_UW_CM2 = 100.0
+APP_NAME = "SW3 + Power Analyzer"
+APP_VERSION = "2.0.0"
+SESSION_SCHEMA_VERSION = 2
+
+# Report Builder roles/tags
+REPORT_SCAN_ROLES = [
+    "Unassigned",
+    "Complete Dataset",
+    "Main Scan",
+    "Spectrum Scan",
+    "Startup Scan",
+    "Composite Multi-phase",
+    "Burn-in Scan",
+    "Warm-up Run",
+    "R2 Validation Scan",
+    "Other",
+    "Ignore",
+]
+REPORT_PHASE_TAGS = [
+    "Unassigned",
+    "Warm-up",
+    "Spectrum Point",
+    "R2 Pullback",
+    "Loose Spectrometer Scan",
+    "Tight Spectrometer Scan",
+    "Spectral Web",
+    "Burn-in",
+    "Ignore",
+]
+REPORT_CSV_ROLES = [
+    "Power Log",
+    "Power Waveform",
+    "Power Factor/Current",
+    "Other",
+]
+REPORT_SEGMENT_TYPES: List[Tuple[str, str]] = [
+    ("warmup", "Warm-up"),
+    ("spectrum_point", "Spectrum Point"),
+    ("r2_pullback", "R2 Pullback"),
+    ("loose_web", "Loose Spectrometer Scan"),
+    ("tight_web", "Tight Spectrometer Scan"),
+]
+WARMUP_FULL_HOUR_MIN_H = 0.90
+WARMUP_FULL_HOUR_MAX_H = 1.20
+
+
+def suggest_report_phase_tag(phase: Dict[str, object]) -> str:
+    """Return a suggested phase tag from procedure naming/type conventions."""
+    name = str(phase.get("name", "") or "").strip().lower()
+    ptype = str(phase.get("phase_type", "") or "").strip().upper()
+    axis = str(phase.get("axis", "") or "").strip().upper()
+
+    if "ignore" in name or "discard" in name:
+        return "Ignore"
+    if "burn" in name:
+        return "Burn-in"
+    if "warm-up" in name or "warmup" in name or ptype == "WARMUP_WAIT":
+        return "Warm-up"
+    if "spectrum point" in name or ptype == "SPECTRUM_POINT":
+        return "Spectrum Point"
+    if "r2" in name or "pullback" in name or ptype == "LINEAR_PULLBACK":
+        return "R2 Pullback"
+    if ptype in ("SPECTRAL_WEB", "INTEGRAL_WEB"):
+        if "tight" in name:
+            return "Tight Spectrometer Scan"
+        if "loose" in name:
+            return "Loose Spectrometer Scan"
+        return "Spectral Web"
+    if axis == "LINEAR":
+        return "R2 Pullback"
+    return "Unassigned"
+
+
+def report_segment_key_for_phase(phase: Dict[str, object], tag: Optional[str] = None) -> Optional[str]:
+    """Map a phase into a canonical segment key used by report selection UI."""
+    name = str(phase.get("name", "") or "").strip().lower()
+    ptype = str(phase.get("phase_type", "") or "").strip().upper()
+    use_tag = (tag or suggest_report_phase_tag(phase) or "").strip()
+
+    if use_tag == "Warm-up":
+        return "warmup"
+    if use_tag == "Spectrum Point":
+        return "spectrum_point"
+    if use_tag == "R2 Pullback":
+        return "r2_pullback"
+    if use_tag == "Loose Spectrometer Scan":
+        return "loose_web"
+    if use_tag == "Tight Spectrometer Scan":
+        return "tight_web"
+    if use_tag == "Spectral Web" or ptype in ("SPECTRAL_WEB", "INTEGRAL_WEB"):
+        if "tight" in name:
+            return "tight_web"
+        if "loose" in name:
+            return "loose_web"
+    return None
+
+
+def choose_latest_full_hour_warmup_segment_id(candidates: List[Dict[str, object]]) -> Optional[str]:
+    """Pick latest warm-up candidate with ~1 hour duration, falling back to latest available."""
+    if not candidates:
+        return None
+
+    full_hour = [
+        c for c in candidates
+        if isinstance(c.get("duration_h"), (int, float))
+        and (WARMUP_FULL_HOUR_MIN_H <= float(c.get("duration_h")) <= WARMUP_FULL_HOUR_MAX_H)
+    ]
+    pool = full_hour if full_hour else candidates
+    best = max(pool, key=lambda c: (float(c.get("start_ts", -1.0)), int(c.get("phase_idx", -1))))
+    seg_id = best.get("segment_id")
+    return str(seg_id) if seg_id else None
+
+
+def suggest_report_scan_role(phases: List[Dict[str, object]]) -> str:
+    """Infer a scan-level role from phase tags and warm-up duration."""
+    if not phases:
+        return "Unassigned"
+
+    tags = [suggest_report_phase_tag(ph) for ph in phases]
+    names = [str(ph.get("name", "") or "").strip().lower() for ph in phases]
+    warmup_h = 0.0
+    warmup_phase_count = 0
+    for ph, tag in zip(phases, tags):
+        if tag != "Warm-up":
+            continue
+        warmup_phase_count += 1
+        start = ph.get("start_ts")
+        end = ph.get("end_ts")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
+            warmup_h += (float(end) - float(start)) / 3600.0
+
+    has_scan_pattern = any(
+        t in ("Spectrum Point", "R2 Pullback", "Loose Spectrometer Scan", "Tight Spectrometer Scan", "Spectral Web")
+        for t in tags
+    )
+    has_spectrum_point = any(t == "Spectrum Point" for t in tags)
+    has_warmup = any(t == "Warm-up" for t in tags)
+    has_r2 = any(t == "R2 Pullback" for t in tags)
+    has_loose = any(t == "Loose Spectrometer Scan" for t in tags)
+    has_tight = any(t == "Tight Spectrometer Scan" for t in tags)
+    has_full_run = has_spectrum_point and has_r2 and has_loose and has_tight
+    has_burnin_marker = any(t == "Burn-in" for t in tags) or any("burn" in n for n in names)
+
+    if has_burnin_marker:
+        return "Burn-in Scan"
+    if has_full_run and (warmup_h >= 12 or warmup_phase_count >= 10):
+        return "Complete Dataset"
+    if has_scan_pattern:
+        return "Main Scan"
+    if has_warmup and has_spectrum_point:
+        return "Startup Scan"
+    if has_warmup:
+        return "Warm-up Run"
+    if has_spectrum_point:
+        return "Spectrum Scan"
+    if len(phases) > 1:
+        return "Composite Multi-phase"
+    return "Unassigned"
 
 # ------------------------------------------------------------------
 # Data models
@@ -579,6 +737,26 @@ class GroupRecord:
     file_ids: Set[str] = field(default_factory=set)
     associations: Dict[str, Set[str]] = field(default_factory=dict)  # sw3_id -> set(power_id)
 
+@dataclass
+class ReportScanRecord:
+    """Report Builder SW3 scan input with optional phase tagging."""
+    scan_id: str
+    path: str
+    label: str
+    role: str = "Unassigned"
+    meta: Dict[str, object] = field(default_factory=dict)
+    phases: List[Dict[str, object]] = field(default_factory=list)
+    phase_tags: Dict[int, str] = field(default_factory=dict)
+
+@dataclass
+class ReportCsvRecord:
+    """Report Builder CSV input with role tag."""
+    csv_id: str
+    path: str
+    label: str
+    role: str = "Power Log"
+    meta: Dict[str, object] = field(default_factory=dict)
+
 # ------------------------------------------------------------------
 # App
 # ------------------------------------------------------------------
@@ -588,7 +766,7 @@ class App(tk.Tk):
     def __init__(self):
         """Initialize UI, state, and plotting caches."""
         super().__init__()
-        self.title("SW3 + Power Analyzer")
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         self._set_initial_geometry()
         self.minsize(920, 620)
         self.option_add("*tearOff", False)
@@ -596,6 +774,16 @@ class App(tk.Tk):
 
         self.files: Dict[str, FileRecord] = {}
         self.groups: Dict[str, GroupRecord] = {}
+        self.report_scans: Dict[str, ReportScanRecord] = {}
+        self.report_csvs: Dict[str, ReportCsvRecord] = {}
+        self._report_selected_scan_id: Optional[str] = None
+        self._report_phase_scan_display_to_id: Dict[str, str] = {}
+        self._report_phase_scan_id_to_display: Dict[str, str] = {}
+        self.report_segment_selection: Dict[str, str] = {}
+        self._report_segment_display_to_id: Dict[str, Dict[str, str]] = {
+            key: {} for key, _ in REPORT_SEGMENT_TYPES
+        }
+        self._report_segment_combos: Dict[str, ttk.Combobox] = {}
 
         # display maps for friendly names
         self._sw3_display_to_id: Dict[str, str] = {}
@@ -707,13 +895,35 @@ class App(tk.Tk):
         # UI
         self.controls_visible   = tk.BooleanVar(self, value=True)
 
+        # report builder
+        self.report_scan_role_var = tk.StringVar(self, value="Unassigned")
+        self.report_phase_tag_var = tk.StringVar(self, value="Unassigned")
+        self.report_csv_role_var  = tk.StringVar(self, value="Power Log")
+        self.report_phase_scan_display_var = tk.StringVar(self, value="")
+        self.report_scan_info_var = tk.StringVar(self, value="No scan selected.")
+        self.report_lamp_image_path_var = tk.StringVar(self, value="")
+        self.report_axes_image_path_var = tk.StringVar(self, value="")
+        self.report_segment_choice_vars = {
+            key: tk.StringVar(self, value="")
+            for key, _ in REPORT_SEGMENT_TYPES
+        }
+
     # ---- UI ----
     def _build_ui(self):
         """Construct the main window layout."""
         self._build_menu()
 
-        # Single vertical panedwindow with three panes
-        self._paned = ttk.Panedwindow(self, orient=tk.VERTICAL)
+        # Main top-level tabs: Analyzer + Report Builder
+        self._main_nb = ttk.Notebook(self)
+        self._main_nb.pack(fill=tk.BOTH, expand=True)
+
+        tab_analyzer = ttk.Frame(self._main_nb)
+        tab_report = ttk.Frame(self._main_nb)
+        self._main_nb.add(tab_analyzer, text="Analyzer")
+        self._main_nb.add(tab_report, text="Report Builder")
+
+        # Analyzer tab: Single vertical panedwindow with three panes
+        self._paned = ttk.Panedwindow(tab_analyzer, orient=tk.VERTICAL)
         self._paned.pack(fill=tk.BOTH, expand=True)
 
         files_container = ttk.Frame(self._paned)
@@ -727,6 +937,9 @@ class App(tk.Tk):
         self._build_files_frame(files_container)
         self._build_groups_frame(groups_container)
         self._build_controls(self._controls_frame)
+
+        # Report Builder tab: full-page layout
+        self._build_report_builder_tab(tab_report)
 
         # status / busy indicator (explicit bottom strip so it stays visible)
         status_shell = tk.Frame(self, bg="#fdf6e3", bd=1, relief=tk.SUNKEN, height=30)
@@ -812,7 +1025,10 @@ class App(tk.Tk):
         # Help
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo(
-            "About", "SW3 + Power Analyzer\nAligns SW3/eegbin optical data with power logs by epoch time."
+            "About",
+            f"{APP_NAME} v{APP_VERSION}\n"
+            "Aligns SW3/eegbin optical data with power logs by epoch time.\n"
+            "Includes a Report Builder tab for scan/CSV/segment metadata setup.",
         ))
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -1116,6 +1332,1016 @@ class App(tk.Tk):
             style="Toolbar.TButton",
             command=lambda: self.lb_groups_select.selection_clear(0, tk.END),
         ).pack(side=tk.LEFT, padx=3)
+
+
+
+    def _build_report_builder_tab(self, parent):
+        """Build the Report Builder UI (scan/CSV inputs + phase tagging)."""
+        tab = ttk.Frame(parent, padding=(8, 7))
+        tab.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            tab,
+            text="Import SW3 scans and CSV inputs, then tag scan phases for report generation.",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(0, 6))
+
+        report_nb = ttk.Notebook(tab)
+        report_nb.pack(fill=tk.BOTH, expand=True)
+
+        tab_inputs = ttk.Frame(report_nb, padding=(4, 4))
+        tab_phase = ttk.Frame(report_nb, padding=(4, 4))
+        report_nb.add(tab_inputs, text="Inputs")
+        report_nb.add(tab_phase, text="Phases & Segments")
+
+        h_pane = ttk.Panedwindow(tab_inputs, orient=tk.HORIZONTAL)
+        h_pane.pack(fill=tk.BOTH, expand=True)
+
+        # ---- SW3 Scans ----
+        scan_frame = ttk.LabelFrame(h_pane, text="SW3 Scans")
+        h_pane.add(scan_frame, weight=1)
+        try:
+            h_pane.pane(scan_frame, minsize=320, weight=1)
+        except Exception:
+            pass
+        scan_toolbar = ttk.Frame(scan_frame)
+        scan_toolbar.pack(fill=tk.X, padx=4, pady=(6, 4))
+        ttk.Button(scan_toolbar, text="Add SW3", style="Toolbar.TButton", command=self.on_add_report_sw3_files).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(scan_toolbar, text="Remove", style="Toolbar.TButton", command=self.on_remove_report_scans).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Separator(scan_toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(scan_toolbar, text="Rename", style="Toolbar.TButton", command=self.on_rename_report_scan).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        scan_container = ttk.Frame(scan_frame)
+        scan_container.pack(fill=tk.BOTH, expand=True, padx=3, pady=(2, 6))
+        scan_cols = ("label", "role", "phases", "first", "last", "path")
+        self.tv_report_scans = ttk.Treeview(scan_container, columns=scan_cols, show="headings", selectmode="browse")
+        scan_heading = {
+            "label": "Label",
+            "role": "Role",
+            "phases": "Phases",
+            "first": "First Seen",
+            "last": "Last Seen",
+            "path": "Path",
+        }
+        for c in scan_cols:
+            self.tv_report_scans.heading(c, text=scan_heading[c])
+            if c == "label":
+                w = 160
+            elif c == "role":
+                w = 120
+            elif c == "phases":
+                w = 60
+            elif c in ("first", "last"):
+                w = 125
+            else:
+                w = 220
+            self.tv_report_scans.column(c, width=w, anchor="w", stretch=True)
+        scan_vsb = ttk.Scrollbar(scan_container, orient="vertical", command=self.tv_report_scans.yview)
+        scan_hsb = ttk.Scrollbar(scan_container, orient="horizontal", command=self.tv_report_scans.xview)
+        self.tv_report_scans.configure(yscroll=scan_vsb.set, xscroll=scan_hsb.set)
+        self.tv_report_scans.grid(row=0, column=0, sticky="nsew")
+        scan_vsb.grid(row=0, column=1, sticky="ns")
+        scan_hsb.grid(row=1, column=0, sticky="ew")
+        scan_container.rowconfigure(0, weight=1)
+        scan_container.columnconfigure(0, weight=1)
+        self.tv_report_scans.bind("<<TreeviewSelect>>", lambda e: self._on_report_scan_selected())
+        self.tv_report_scans.bind("<Double-1>", lambda e: self.on_rename_report_scan())
+
+        # ---- CSV Inputs ----
+        csv_frame = ttk.LabelFrame(h_pane, text="CSV Inputs")
+        h_pane.add(csv_frame, weight=1)
+        try:
+            h_pane.pane(csv_frame, minsize=320, weight=1)
+        except Exception:
+            pass
+        csv_toolbar = ttk.Frame(csv_frame)
+        csv_toolbar.pack(fill=tk.X, padx=4, pady=(6, 4))
+        ttk.Button(csv_toolbar, text="Add CSV", style="Toolbar.TButton", command=self.on_add_report_csv_files).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(csv_toolbar, text="Remove", style="Toolbar.TButton", command=self.on_remove_report_csvs).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Separator(csv_toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(csv_toolbar, text="Rename", style="Toolbar.TButton", command=self.on_rename_report_csv).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        csv_container = ttk.Frame(csv_frame)
+        csv_container.pack(fill=tk.BOTH, expand=True, padx=3, pady=(2, 6))
+        csv_cols = ("label", "role", "columns", "size", "path")
+        self.tv_report_csvs = ttk.Treeview(csv_container, columns=csv_cols, show="headings", selectmode="browse")
+        csv_heading = {
+            "label": "Label",
+            "role": "Role",
+            "columns": "Columns",
+            "size": "Size",
+            "path": "Path",
+        }
+        for c in csv_cols:
+            self.tv_report_csvs.heading(c, text=csv_heading[c])
+            if c == "label":
+                w = 150
+            elif c == "role":
+                w = 130
+            elif c == "columns":
+                w = 170
+            elif c == "size":
+                w = 80
+            else:
+                w = 220
+            self.tv_report_csvs.column(c, width=w, anchor="w", stretch=True)
+        csv_vsb = ttk.Scrollbar(csv_container, orient="vertical", command=self.tv_report_csvs.yview)
+        csv_hsb = ttk.Scrollbar(csv_container, orient="horizontal", command=self.tv_report_csvs.xview)
+        self.tv_report_csvs.configure(yscroll=csv_vsb.set, xscroll=csv_hsb.set)
+        self.tv_report_csvs.grid(row=0, column=0, sticky="nsew")
+        csv_vsb.grid(row=0, column=1, sticky="ns")
+        csv_hsb.grid(row=1, column=0, sticky="ew")
+        csv_container.rowconfigure(0, weight=1)
+        csv_container.columnconfigure(0, weight=1)
+        self.tv_report_csvs.bind("<<TreeviewSelect>>", lambda e: self._on_report_csv_selected())
+        self.tv_report_csvs.bind("<Double-1>", lambda e: self.on_rename_report_csv())
+
+        csv_footer = ttk.Frame(csv_frame)
+        csv_footer.pack(fill=tk.X, padx=4, pady=(0, 6))
+        ttk.Label(csv_footer, text="Selected CSV role:").pack(side=tk.LEFT, padx=(0, 4))
+        self.cb_report_csv_role = ttk.Combobox(
+            csv_footer,
+            state="readonly",
+            width=22,
+            textvariable=self.report_csv_role_var,
+            values=REPORT_CSV_ROLES,
+        )
+        self.cb_report_csv_role.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(csv_footer, text="Set Role", style="Toolbar.TButton", command=self.on_report_set_csv_role).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        image_frame = ttk.LabelFrame(csv_frame, text="Report Images")
+        image_frame.pack(fill=tk.X, padx=4, pady=(0, 6))
+
+        img_grid = ttk.Frame(image_frame)
+        img_grid.pack(fill=tk.X, padx=4, pady=(6, 6))
+        img_grid.columnconfigure(1, weight=1)
+        img_grid.columnconfigure(2, minsize=90)
+        img_grid.columnconfigure(3, minsize=66)
+
+        ttk.Label(img_grid, text="Lamp photo").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Entry(
+            img_grid,
+            textvariable=self.report_lamp_image_path_var,
+            state="readonly",
+            width=38,
+        ).grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        ttk.Button(
+            img_grid,
+            text="Browse...",
+            style="Toolbar.TButton",
+            command=self.on_report_set_lamp_image,
+        ).grid(row=0, column=2, sticky="ew", padx=(6, 2), pady=(0, 4))
+        ttk.Button(
+            img_grid,
+            text="Clear",
+            style="Toolbar.TButton",
+            command=lambda: self._set_report_image_path("lamp", ""),
+        ).grid(row=0, column=3, sticky="ew", padx=(2, 0), pady=(0, 4))
+
+        ttk.Label(img_grid, text="Axes photo").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(
+            img_grid,
+            textvariable=self.report_axes_image_path_var,
+            state="readonly",
+            width=38,
+        ).grid(row=1, column=1, sticky="ew")
+        ttk.Button(
+            img_grid,
+            text="Browse...",
+            style="Toolbar.TButton",
+            command=self.on_report_set_axes_image,
+        ).grid(row=1, column=2, sticky="ew", padx=(6, 2))
+        ttk.Button(
+            img_grid,
+            text="Clear",
+            style="Toolbar.TButton",
+            command=lambda: self._set_report_image_path("axes", ""),
+        ).grid(row=1, column=3, sticky="ew", padx=(2, 0))
+
+        # ---- Phase Tagging ----
+        phase_frame = ttk.LabelFrame(tab_phase, text="Phase Tagging")
+        phase_frame.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+
+        row0 = ttk.Frame(phase_frame)
+        row0.pack(fill=tk.X, padx=4, pady=(6, 2))
+        ttk.Label(row0, text="Scan").pack(side=tk.LEFT, padx=(0, 4))
+        self.cb_report_phase_scan = ttk.Combobox(
+            row0,
+            state="readonly",
+            width=46,
+            textvariable=self.report_phase_scan_display_var,
+        )
+        self.cb_report_phase_scan.pack(side=tk.LEFT, padx=(0, 8))
+        self.cb_report_phase_scan.bind("<<ComboboxSelected>>", lambda _e: self._on_report_phase_scan_combo_selected())
+        ttk.Label(row0, textvariable=self.report_scan_info_var, style="Hint.TLabel").pack(side=tk.LEFT)
+
+        row1 = ttk.Frame(phase_frame)
+        row1.pack(fill=tk.X, padx=4, pady=(4, 2))
+        ttk.Label(row1, text="Scan role").pack(side=tk.LEFT, padx=(0, 4))
+        self.cb_report_scan_role = ttk.Combobox(
+            row1,
+            state="readonly",
+            width=18,
+            textvariable=self.report_scan_role_var,
+            values=REPORT_SCAN_ROLES,
+        )
+        self.cb_report_scan_role.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row1, text="Set Scan Role", style="Toolbar.TButton", command=self.on_report_set_scan_role).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(
+            row1,
+            text="Apply Role",
+            style="Toolbar.TButton",
+            command=self.on_report_apply_role_to_phases,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="Auto-tag", style="Toolbar.TButton", command=self.on_report_auto_tag_phases).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        phase_container = ttk.Frame(phase_frame)
+        phase_container.pack(fill=tk.BOTH, expand=True, padx=3, pady=(2, 4))
+        phase_cols = ("index", "name", "type", "axis", "start", "end", "duration_h", "count", "tag")
+        self.tv_report_phases = ttk.Treeview(
+            phase_container,
+            columns=phase_cols,
+            show="headings",
+            selectmode="extended",
+            height=5,
+        )
+        phase_heading = {
+            "index": "#",
+            "name": "Phase",
+            "type": "Type",
+            "axis": "Axis",
+            "start": "Start",
+            "end": "End",
+            "duration_h": "Duration (h)",
+            "count": "Rows",
+            "tag": "Tag",
+        }
+        for c in phase_cols:
+            self.tv_report_phases.heading(c, text=phase_heading[c])
+            if c == "index":
+                w = 40
+            elif c == "name":
+                w = 150
+            elif c == "type":
+                w = 95
+            elif c == "axis":
+                w = 70
+            elif c in ("start", "end"):
+                w = 120
+            elif c == "duration_h":
+                w = 90
+            elif c == "count":
+                w = 60
+            else:
+                w = 130
+            self.tv_report_phases.column(c, width=w, anchor="w", stretch=True)
+        phase_vsb = ttk.Scrollbar(phase_container, orient="vertical", command=self.tv_report_phases.yview)
+        phase_hsb = ttk.Scrollbar(phase_container, orient="horizontal", command=self.tv_report_phases.xview)
+        self.tv_report_phases.configure(yscroll=phase_vsb.set, xscroll=phase_hsb.set)
+        self.tv_report_phases.grid(row=0, column=0, sticky="nsew")
+        phase_vsb.grid(row=0, column=1, sticky="ns")
+        phase_hsb.grid(row=1, column=0, sticky="ew")
+        phase_container.rowconfigure(0, weight=1)
+        phase_container.columnconfigure(0, weight=1)
+
+        row2 = ttk.Frame(phase_frame)
+        row2.pack(fill=tk.X, padx=4, pady=(2, 6))
+        ttk.Label(row2, text="Phase tag").pack(side=tk.LEFT, padx=(0, 4))
+        self.cb_report_phase_tag = ttk.Combobox(
+            row2,
+            state="readonly",
+            width=20,
+            textvariable=self.report_phase_tag_var,
+            values=REPORT_PHASE_TAGS,
+        )
+        self.cb_report_phase_tag.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            row2,
+            text="Set Tag for Selected Phases",
+            style="Primary.TButton",
+            command=self.on_report_set_phase_tag,
+        ).pack(side=tk.LEFT, padx=2)
+
+        seg_frame = ttk.LabelFrame(phase_frame, text="Segment Selection (Choose Which Duplicate Phase To Use)")
+        seg_frame.pack(fill=tk.X, padx=4, pady=(2, 4))
+        seg_toolbar = ttk.Frame(seg_frame)
+        seg_toolbar.pack(fill=tk.X, padx=4, pady=(6, 4))
+        ttk.Button(
+            seg_toolbar,
+            text="Auto Latest",
+            style="Toolbar.TButton",
+            command=self.on_report_autoselect_segments_latest,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            seg_toolbar,
+            text="Auto Selected Scan",
+            style="Toolbar.TButton",
+            command=self.on_report_autoselect_segments_from_selected_scan,
+        ).pack(side=tk.LEFT, padx=2)
+
+        seg_grid = ttk.Frame(seg_frame)
+        seg_grid.pack(fill=tk.X, padx=4, pady=(2, 6))
+        for row_idx, (seg_key, seg_label) in enumerate(REPORT_SEGMENT_TYPES):
+            ttk.Label(seg_grid, text=f"{seg_label}:").grid(
+                row=row_idx, column=0, sticky="w", padx=(0, 6), pady=2
+            )
+            cb = ttk.Combobox(
+                seg_grid,
+                state="readonly",
+                width=56,
+                textvariable=self.report_segment_choice_vars[seg_key],
+            )
+            cb.grid(row=row_idx, column=1, sticky="ew", pady=2)
+            cb.bind("<<ComboboxSelected>>", lambda _e, key=seg_key: self._on_report_segment_choice(key))
+            self._report_segment_combos[seg_key] = cb
+        seg_grid.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            phase_frame,
+            text="Tip: warm-up auto-selection uses the latest ~1 hour warm-up segment in the chosen SW3 run.",
+            style="Hint.TLabel",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        self._refresh_report_segment_selectors()
+
+    # ---- Report Builder actions ----
+    def on_add_report_sw3_files(self):
+        """Prompt for SW3 scans and add them to the Report Builder list."""
+        paths = filedialog.askopenfilenames(
+            title="Add SW3/eegbin Files (Report Builder)",
+            filetypes=[("SW3/eegbin", "*.sw3 *.eegbin *.bin *.*")],
+        )
+        if not paths:
+            return
+        ensure_eegbin_imported()
+        n = 0
+        for path in paths:
+            sweep = self._load_sweep_from_path(path, warn=True, trace=True)
+            if sweep is None:
+                continue
+            meta = self._meta_from_sweep(sweep)
+            phases = self._summarize_scan_phases(sweep)
+            meta["phase_count"] = len(phases)
+            inferred_role = suggest_report_scan_role(phases)
+            phase_tags = {}
+            for ph in phases:
+                idx = int(ph.get("index", 0))
+                tag = suggest_report_phase_tag(ph)
+                if tag and tag != "Unassigned":
+                    phase_tags[idx] = tag
+            scan_id = self._next_report_scan_id()
+            self.report_scans[scan_id] = ReportScanRecord(
+                scan_id=scan_id,
+                path=os.path.abspath(path),
+                label=os.path.basename(path),
+                role=inferred_role,
+                meta=meta,
+                phases=phases,
+                phase_tags=phase_tags,
+            )
+            n += 1
+        if n:
+            self._refresh_report_scans_tv()
+            self._refresh_report_segment_selectors()
+            self._set_status(f"Added {n} report scan(s).")
+
+    def on_add_report_csv_files(self):
+        """Prompt for CSV files and add them to the Report Builder list."""
+        paths = filedialog.askopenfilenames(
+            title="Add CSV Files (Report Builder)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not paths:
+            return
+        n = 0
+        for path in paths:
+            meta = self._load_report_csv_meta(path)
+            suggested_role = self._suggest_report_csv_role(path, meta)
+            csv_id = self._next_report_csv_id()
+            self.report_csvs[csv_id] = ReportCsvRecord(
+                csv_id=csv_id,
+                path=os.path.abspath(path),
+                label=os.path.basename(path),
+                role=suggested_role,
+                meta=meta,
+            )
+            n += 1
+        if n:
+            self._refresh_report_csvs_tv()
+            self._set_status(f"Added {n} report CSV file(s).")
+
+    def on_remove_report_scans(self):
+        """Remove selected Report Builder scans."""
+        sel = list(self.tv_report_scans.selection())
+        if not sel:
+            messagebox.showinfo("Remove", "Select one or more scans to remove.")
+            return
+        if not messagebox.askyesno("Remove", f"Remove {len(sel)} scan(s) from Report Builder?"):
+            return
+        for sid in sel:
+            self.report_scans.pop(sid, None)
+            if self._report_selected_scan_id == sid:
+                self._report_selected_scan_id = None
+        self._refresh_report_scans_tv()
+        self._refresh_report_segment_selectors()
+
+    def on_remove_report_csvs(self):
+        """Remove selected Report Builder CSVs."""
+        sel = list(self.tv_report_csvs.selection())
+        if not sel:
+            messagebox.showinfo("Remove", "Select one or more CSVs to remove.")
+            return
+        if not messagebox.askyesno("Remove", f"Remove {len(sel)} CSV file(s) from Report Builder?"):
+            return
+        for cid in sel:
+            self.report_csvs.pop(cid, None)
+        self._refresh_report_csvs_tv()
+
+    def on_rename_report_scan(self):
+        """Rename the selected Report Builder scan label."""
+        sel = self.tv_report_scans.selection()
+        if not sel:
+            return
+        sid = sel[0]
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            return
+        new = simpledialog.askstring("Rename Scan", "New label:", initialvalue=rec.label, parent=self)
+        if new:
+            rec.label = new.strip()
+            self._refresh_report_scans_tv()
+            self._refresh_report_segment_selectors()
+            if self._report_selected_scan_id == sid:
+                self.report_scan_info_var.set(f"{rec.label} ({sid})")
+
+    def on_rename_report_csv(self):
+        """Rename the selected Report Builder CSV label."""
+        sel = self.tv_report_csvs.selection()
+        if not sel:
+            return
+        cid = sel[0]
+        rec = self.report_csvs.get(cid)
+        if rec is None:
+            return
+        new = simpledialog.askstring("Rename CSV", "New label:", initialvalue=rec.label, parent=self)
+        if new:
+            rec.label = new.strip()
+            self._refresh_report_csvs_tv()
+
+    def on_report_set_scan_role(self):
+        """Assign the selected scan role."""
+        sid = self._current_report_scan_id()
+        if not sid:
+            messagebox.showinfo("Scan Role", "Select a scan first.")
+            return
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            return
+        rec.role = self.report_scan_role_var.get() or "Unassigned"
+        self._refresh_report_scans_tv()
+
+    def on_report_apply_role_to_phases(self):
+        """Apply the current scan role to all phases of the selected scan."""
+        sid = self._current_report_scan_id()
+        if not sid:
+            messagebox.showinfo("Apply Role", "Select a scan first.")
+            return
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            return
+        if not rec.phases:
+            messagebox.showinfo("Apply Role", "Selected scan has no phases to tag.")
+            return
+        role = self.report_scan_role_var.get() or "Unassigned"
+        role_to_phase = {
+            "Warm-up Run": "Warm-up",
+            "Startup Scan": "Warm-up",
+            "Spectrum Scan": "Spectrum Point",
+            "R2 Validation Scan": "R2 Pullback",
+            "Burn-in Scan": "Burn-in",
+        }
+        phase_tag = role_to_phase.get(role)
+        if not phase_tag:
+            messagebox.showinfo(
+                "Apply Role",
+                "The selected role is scan-level only. Use phase tagging or Auto-tag for segment tags.",
+            )
+            return
+        for ph in rec.phases:
+            idx = int(ph.get("index", 0))
+            rec.phase_tags[idx] = phase_tag
+        self._refresh_report_phases_tv(rec)
+        self._refresh_report_segment_selectors()
+
+    def on_report_set_phase_tag(self):
+        """Set tag for selected phases of the active scan."""
+        sid = self._current_report_scan_id()
+        if not sid:
+            messagebox.showinfo("Phase Tag", "Select a scan first.")
+            return
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            return
+        sel = list(self.tv_report_phases.selection())
+        if not sel:
+            messagebox.showinfo("Phase Tag", "Select one or more phases to tag.")
+            return
+        tag = self.report_phase_tag_var.get() or "Unassigned"
+        for iid in sel:
+            try:
+                idx = int(iid)
+            except Exception:
+                continue
+            rec.phase_tags[idx] = tag
+        self._refresh_report_phases_tv(rec)
+        self._refresh_report_segment_selectors()
+
+    def on_report_auto_tag_phases(self):
+        """Auto-tag phases based on phase name/type heuristics."""
+        sid = self._current_report_scan_id()
+        if not sid:
+            messagebox.showinfo("Auto-tag", "Select a scan first.")
+            return
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            return
+        if not rec.phases:
+            messagebox.showinfo("Auto-tag", "Selected scan has no phases to tag.")
+            return
+        for ph in rec.phases:
+            idx = int(ph.get("index", 0))
+            suggested = self._suggest_report_phase_tag(ph)
+            if suggested and suggested != "Unassigned":
+                rec.phase_tags[idx] = suggested
+        rec.role = suggest_report_scan_role(rec.phases)
+        self.report_scan_role_var.set(rec.role or "Unassigned")
+        self._refresh_report_scans_tv()
+        self._refresh_report_phases_tv(rec)
+        self._refresh_report_segment_selectors()
+
+    def on_report_set_csv_role(self):
+        """Assign the selected CSV role."""
+        cid = self._current_report_csv_id()
+        if not cid:
+            messagebox.showinfo("CSV Role", "Select a CSV first.")
+            return
+        rec = self.report_csvs.get(cid)
+        if rec is None:
+            return
+        rec.role = self.report_csv_role_var.get() or "Other"
+        self._refresh_report_csvs_tv()
+
+    def on_report_set_lamp_image(self):
+        """Choose the lamp photo image used in report output."""
+        path = self._choose_report_image_path("Select Lamp Photo")
+        if path:
+            self._set_report_image_path("lamp", path)
+
+    def on_report_set_axes_image(self):
+        """Choose the axes-labeled photo used in report output."""
+        path = self._choose_report_image_path("Select Axes Photo")
+        if path:
+            self._set_report_image_path("axes", path)
+
+    def _report_image_initial_dir(self) -> str:
+        """Best-effort initial directory for image picker."""
+        for candidate in (
+            self.report_lamp_image_path_var.get().strip(),
+            self.report_axes_image_path_var.get().strip(),
+        ):
+            if candidate:
+                folder = os.path.dirname(candidate)
+                if os.path.isdir(folder):
+                    return folder
+        sid = self._current_report_scan_id()
+        rec = self.report_scans.get(sid) if sid else None
+        if rec and rec.path:
+            folder = os.path.dirname(rec.path)
+            if os.path.isdir(folder):
+                return folder
+        return os.getcwd()
+
+    def _choose_report_image_path(self, title: str) -> Optional[str]:
+        """Open an image picker for report asset files."""
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=self._report_image_initial_dir(),
+            filetypes=[
+                ("PNG images", "*.png"),
+                ("JPEG images", "*.jpg *.jpeg"),
+                ("All images", "*.png *.jpg *.jpeg *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return None
+        return os.path.abspath(path)
+
+    def _set_report_image_path(self, kind: str, path: str):
+        """Update stored report image path for lamp/axes assets."""
+        normalized = os.path.abspath(path) if path else ""
+        if kind == "lamp":
+            self.report_lamp_image_path_var.set(normalized)
+            label = "lamp photo"
+        elif kind == "axes":
+            self.report_axes_image_path_var.set(normalized)
+            label = "axes photo"
+        else:
+            return
+        if normalized:
+            self._set_status(f"Set {label}: {os.path.basename(normalized)}")
+        else:
+            self._set_status(f"Cleared {label}.")
+
+    def on_report_autoselect_segments_latest(self):
+        """Auto-pick segment selections using latest-run heuristics."""
+        self._refresh_report_segment_selectors(force_default=True, scan_id_hint=None)
+        self._set_status("Auto-selected report segments from latest available runs.")
+
+    def on_report_autoselect_segments_from_selected_scan(self):
+        """Auto-pick segment selections preferring the currently selected scan."""
+        sid = self._current_report_scan_id()
+        if not sid:
+            messagebox.showinfo("Segment Selection", "Select a scan first.")
+            return
+        self._refresh_report_segment_selectors(force_default=True, scan_id_hint=sid)
+        self._set_status("Auto-selected report segments from selected scan where available.")
+
+    def _on_report_segment_choice(self, seg_key: str):
+        """Persist user selection for a report segment type."""
+        var = self.report_segment_choice_vars.get(seg_key)
+        if var is None:
+            return
+        disp = var.get().strip()
+        seg_id = self._report_segment_display_to_id.get(seg_key, {}).get(disp)
+        if seg_id:
+            self.report_segment_selection[seg_key] = seg_id
+        else:
+            self.report_segment_selection.pop(seg_key, None)
+
+    def _phase_tag_for_record(self, rec: ReportScanRecord, idx: int, phase: Dict[str, object]) -> str:
+        """Return explicit phase tag or inferred fallback."""
+        tag = rec.phase_tags.get(idx)
+        if isinstance(tag, str) and tag.strip() and tag != "Unassigned" and tag in REPORT_PHASE_TAGS:
+            return tag
+        return suggest_report_phase_tag(phase)
+
+    def _format_report_segment_candidate(self, rec: ReportScanRecord, idx: int, phase: Dict[str, object]) -> str:
+        """Build display text for a segment candidate."""
+        phase_name = str(phase.get("name", f"Phase {idx + 1}"))
+        start_ts = phase.get("start_ts")
+        start_txt = human_datetime(start_ts) if isinstance(start_ts, (int, float)) else ""
+        duration_h = phase.get("duration_h", 0.0)
+        duration_txt = (
+            f"{float(duration_h):.3f} h"
+            if isinstance(duration_h, (int, float)) and float(duration_h) > 0
+            else "n/a"
+        )
+        return f"{rec.label} :: P{idx + 1} {phase_name} :: {start_txt} :: {duration_txt}"
+
+    def _collect_report_segment_candidates(self) -> Dict[str, List[Dict[str, object]]]:
+        """Collect candidates for each canonical report segment type."""
+        out: Dict[str, List[Dict[str, object]]] = {key: [] for key, _ in REPORT_SEGMENT_TYPES}
+        scans_sorted = sorted(
+            self.report_scans.items(),
+            key=lambda item: (
+                float(item[1].meta.get("first_ts")) if isinstance(item[1].meta.get("first_ts"), (int, float)) else -1.0,
+                item[0],
+            ),
+        )
+        for sid, rec in scans_sorted:
+            for phase in rec.phases:
+                idx = int(phase.get("index", 0))
+                tag = self._phase_tag_for_record(rec, idx, phase)
+                seg_key = report_segment_key_for_phase(phase, tag)
+                if seg_key is None:
+                    continue
+                start_ts = phase.get("start_ts")
+                duration_h = phase.get("duration_h", 0.0)
+                out[seg_key].append(
+                    {
+                        "segment_id": f"{sid}:{idx}",
+                        "display": self._format_report_segment_candidate(rec, idx, phase),
+                        "scan_id": sid,
+                        "phase_idx": idx,
+                        "start_ts": float(start_ts) if isinstance(start_ts, (int, float)) else float("-inf"),
+                        "duration_h": float(duration_h) if isinstance(duration_h, (int, float)) else 0.0,
+                    }
+                )
+        for seg_key in out:
+            out[seg_key].sort(key=lambda c: (c["start_ts"], c["phase_idx"]))
+        return out
+
+    def _pick_default_segment(
+        self,
+        seg_key: str,
+        candidates: List[Dict[str, object]],
+        scan_id_hint: Optional[str] = None,
+    ) -> Optional[str]:
+        """Pick a default segment id for a segment type."""
+        if not candidates:
+            return None
+        if scan_id_hint:
+            hinted = [c for c in candidates if c.get("scan_id") == scan_id_hint]
+            if hinted:
+                if seg_key == "warmup":
+                    return choose_latest_full_hour_warmup_segment_id(hinted)
+                return max(hinted, key=lambda c: c.get("start_ts", -1.0)).get("segment_id")
+        if seg_key == "warmup":
+            return choose_latest_full_hour_warmup_segment_id(candidates)
+        return max(candidates, key=lambda c: c.get("start_ts", -1.0)).get("segment_id")
+
+    def _refresh_report_segment_selectors(
+        self,
+        force_default: bool = False,
+        scan_id_hint: Optional[str] = None,
+    ):
+        """Refresh segment pickers and preserve explicit user choices when possible."""
+        candidates_by_key = self._collect_report_segment_candidates()
+        for seg_key, _seg_label in REPORT_SEGMENT_TYPES:
+            combo = self._report_segment_combos.get(seg_key)
+            if combo is None:
+                continue
+            candidates = candidates_by_key.get(seg_key, [])
+            display_to_id: Dict[str, str] = {}
+            values: List[str] = []
+            for cand in candidates:
+                disp = str(cand.get("display", ""))
+                if disp in display_to_id:
+                    disp = f"{disp} [{cand.get('segment_id')}]"
+                display_to_id[disp] = str(cand.get("segment_id"))
+                values.append(disp)
+            self._report_segment_display_to_id[seg_key] = display_to_id
+            combo["values"] = values
+
+            candidate_ids = {str(c.get("segment_id")) for c in candidates}
+            current_id = self.report_segment_selection.get(seg_key)
+            target_id: Optional[str] = current_id if current_id in candidate_ids else None
+            if force_default or target_id is None:
+                target_id = self._pick_default_segment(seg_key, candidates, scan_id_hint=scan_id_hint)
+            if target_id:
+                self.report_segment_selection[seg_key] = target_id
+            else:
+                self.report_segment_selection.pop(seg_key, None)
+
+            target_display = ""
+            if target_id:
+                for disp, seg_id in display_to_id.items():
+                    if seg_id == target_id:
+                        target_display = disp
+                        break
+            self.report_segment_choice_vars[seg_key].set(target_display)
+
+    def _summarize_scan_phases(self, sweep) -> List[Dict[str, object]]:
+        """Return a list of phase summaries for a scan."""
+        phases = []
+        for idx, ph in enumerate(getattr(sweep, "phases", []) or []):
+            rows = [r for r in getattr(ph, "members", []) if getattr(r, "timestamp", None) is not None]
+            ts = [r.timestamp for r in rows]
+            start = float(min(ts)) if ts else None
+            end = float(max(ts)) if ts else None
+            duration_h = ((end - start) / 3600.0) if (start is not None and end is not None and end > start) else 0.0
+            phases.append({
+                "index": idx,
+                "name": getattr(ph, "name", "") or f"Phase {idx + 1}",
+                "phase_type": getattr(getattr(ph, "phase_type", None), "name", str(getattr(ph, "phase_type", ""))),
+                "axis": getattr(getattr(ph, "major_axis", None), "name", str(getattr(ph, "major_axis", ""))),
+                "start_ts": start,
+                "end_ts": end,
+                "duration_h": float(duration_h),
+                "count": len(getattr(ph, "members", []) or []),
+            })
+        return phases
+
+    def _suggest_report_phase_tag(self, phase: Dict[str, object]) -> str:
+        """Return a suggested tag for a phase based on name/type."""
+        return suggest_report_phase_tag(phase)
+
+    def _load_report_csv_meta(self, path: str) -> Dict[str, object]:
+        """Load lightweight metadata for a Report Builder CSV file."""
+        abs_path = os.path.abspath(path)
+        meta: Dict[str, object] = {}
+        try:
+            meta["size_bytes"] = int(os.path.getsize(abs_path))
+        except Exception:
+            meta["size_bytes"] = None
+        try:
+            header = pd.read_csv(abs_path, nrows=0)
+            cols = [str(c) for c in list(header.columns)]
+            meta["columns"] = cols
+            meta["column_count"] = len(cols)
+        except Exception as e:
+            meta["columns"] = []
+            meta["column_count"] = 0
+            meta["error"] = str(e)
+        return meta
+
+    def _suggest_report_csv_role(self, path: str, meta: Dict[str, object]) -> str:
+        """Infer a report CSV role from filename/column hints."""
+        name = os.path.basename(path).lower()
+        cols = [str(c).lower() for c in meta.get("columns", [])]
+        colset = set(cols)
+
+        if "wfm" in name or "waveform" in name:
+            return "Power Waveform"
+        if "pwr_log" in name or "power_log" in name or "powerlog" in name:
+            return "Power Log"
+
+        pf_markers = ("pf", "power_factor", "thd", "vrms", "irms", "current", "voltage", "frequency")
+        if any(any(marker in c for marker in pf_markers) for c in colset):
+            return "Power Factor/Current"
+
+        has_ts = any(c in colset for c in ("timestamp", "time", "epoch"))
+        has_power = any(c in colset for c in ("w_active", "watts", "power_w", "w"))
+        if has_ts and has_power:
+            return "Power Log"
+
+        return "Other"
+
+    def _format_columns_summary(self, cols: List[str]) -> str:
+        """Return a compact string summary for CSV columns."""
+        if not cols:
+            return ""
+        short = ", ".join(cols[:3])
+        extra = "" if len(cols) <= 3 else f", ... (+{len(cols) - 3})"
+        return f"{len(cols)} cols: {short}{extra}"
+
+    def _format_size(self, size_bytes: Optional[int]) -> str:
+        """Pretty format a byte size."""
+        if not size_bytes or size_bytes <= 0:
+            return ""
+        size = float(size_bytes)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024.0 or unit == "TB":
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size_bytes} B"
+
+    def _refresh_report_scans_tv(self):
+        """Refresh the Report Builder scans treeview."""
+        self.tv_report_scans.delete(*self.tv_report_scans.get_children())
+        for sid, rec in self.report_scans.items():
+            first = human_datetime(rec.meta.get("first_ts")) if rec.meta.get("first_ts") else ""
+            last = human_datetime(rec.meta.get("last_ts")) if rec.meta.get("last_ts") else ""
+            phase_count = rec.meta.get("phase_count", len(rec.phases))
+            self.tv_report_scans.insert(
+                "",
+                "end",
+                iid=sid,
+                values=(rec.label, rec.role, phase_count, first, last, rec.path),
+            )
+        self._refresh_report_phase_scan_selector()
+        active_sid = self._report_selected_scan_id if self._report_selected_scan_id in self.report_scans else None
+        if active_sid is None and self.report_scans:
+            active_sid = next(iter(self.report_scans.keys()))
+        self._set_active_report_scan(active_sid, sync_tree=True, sync_combo=True)
+
+    def _refresh_report_csvs_tv(self):
+        """Refresh the Report Builder CSV treeview."""
+        self.tv_report_csvs.delete(*self.tv_report_csvs.get_children())
+        for cid, rec in self.report_csvs.items():
+            cols = rec.meta.get("columns", []) if isinstance(rec.meta, dict) else []
+            col_text = self._format_columns_summary(cols)
+            size_text = self._format_size(rec.meta.get("size_bytes") if isinstance(rec.meta, dict) else None)
+            self.tv_report_csvs.insert(
+                "",
+                "end",
+                iid=cid,
+                values=(rec.label, rec.role, col_text, size_text, rec.path),
+            )
+
+    def _refresh_report_phases_tv(self, rec: Optional[ReportScanRecord]):
+        """Refresh the phases list for the selected report scan."""
+        self.tv_report_phases.delete(*self.tv_report_phases.get_children())
+        if rec is None:
+            return
+        for ph in rec.phases:
+            idx = int(ph.get("index", 0))
+            name = ph.get("name", f"Phase {idx + 1}")
+            ptype = ph.get("phase_type", "")
+            axis = ph.get("axis", "")
+            start = human_datetime(ph.get("start_ts")) if ph.get("start_ts") else ""
+            end = human_datetime(ph.get("end_ts")) if ph.get("end_ts") else ""
+            duration_h = ph.get("duration_h", 0.0)
+            duration_txt = f"{float(duration_h):.3f}" if isinstance(duration_h, (int, float)) else ""
+            count = ph.get("count", "")
+            raw_tag = rec.phase_tags.get(idx)
+            tag = raw_tag if raw_tag in REPORT_PHASE_TAGS else suggest_report_phase_tag(ph)
+            self.tv_report_phases.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(idx + 1, name, ptype, axis, start, end, duration_txt, count, tag),
+            )
+
+    def _refresh_report_phase_scan_selector(self):
+        """Refresh scan picker shown on the Phases tab."""
+        if not hasattr(self, "cb_report_phase_scan"):
+            return
+        label_counts: Dict[str, int] = {}
+        for rec in self.report_scans.values():
+            label_counts[rec.label] = label_counts.get(rec.label, 0) + 1
+        self._report_phase_scan_display_to_id.clear()
+        self._report_phase_scan_id_to_display.clear()
+        values: List[str] = []
+        for sid, rec in self.report_scans.items():
+            disp = rec.label if label_counts.get(rec.label, 0) == 1 else f"{rec.label} [{sid}]"
+            self._report_phase_scan_display_to_id[disp] = sid
+            self._report_phase_scan_id_to_display[sid] = disp
+            values.append(disp)
+        self.cb_report_phase_scan["values"] = values
+
+    def _set_active_report_scan(self, sid: Optional[str], sync_tree: bool = True, sync_combo: bool = True):
+        """Set active report scan and sync both Inputs and Phases controls."""
+        sid = sid if (sid and sid in self.report_scans) else None
+        self._report_selected_scan_id = sid
+
+        if sid is None:
+            self.report_scan_info_var.set("No scan selected.")
+            self.report_scan_role_var.set("Unassigned")
+            self._refresh_report_phases_tv(None)
+            if sync_tree and hasattr(self, "tv_report_scans"):
+                cur = list(self.tv_report_scans.selection())
+                if cur:
+                    self.tv_report_scans.selection_remove(*cur)
+            if sync_combo:
+                self.report_phase_scan_display_var.set("")
+            return
+
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            self._set_active_report_scan(None, sync_tree=sync_tree, sync_combo=sync_combo)
+            return
+
+        self.report_scan_info_var.set(f"{rec.label} ({sid})")
+        self.report_scan_role_var.set(rec.role or "Unassigned")
+        self._refresh_report_phases_tv(rec)
+
+        if sync_tree and hasattr(self, "tv_report_scans"):
+            cur = self.tv_report_scans.selection()
+            if tuple(cur) != (sid,):
+                self.tv_report_scans.selection_set(sid)
+                self.tv_report_scans.focus(sid)
+        if sync_combo:
+            disp = self._report_phase_scan_id_to_display.get(sid, "")
+            self.report_phase_scan_display_var.set(disp)
+
+    def _on_report_scan_selected(self):
+        """Update phase tagging panel when a report scan is selected in Inputs tab."""
+        sel = self.tv_report_scans.selection()
+        if not sel:
+            return
+        sid = sel[0]
+        self._set_active_report_scan(sid, sync_tree=False, sync_combo=True)
+
+    def _on_report_phase_scan_combo_selected(self):
+        """Update active scan when selection changes in Phases tab scan picker."""
+        disp = self.report_phase_scan_display_var.get().strip()
+        sid = self._report_phase_scan_display_to_id.get(disp)
+        if sid:
+            self._set_active_report_scan(sid, sync_tree=True, sync_combo=False)
+
+    def _on_report_csv_selected(self):
+        """Update CSV role selection when a report CSV is selected."""
+        sel = self.tv_report_csvs.selection()
+        if not sel:
+            return
+        cid = sel[0]
+        rec = self.report_csvs.get(cid)
+        if rec is None:
+            return
+        self.report_csv_role_var.set(rec.role or "Other")
+
+    def _current_report_scan_id(self) -> Optional[str]:
+        """Return the selected report scan id, if any."""
+        sel = self.tv_report_scans.selection()
+        if sel:
+            return sel[0]
+        return self._report_selected_scan_id
+
+    def _current_report_csv_id(self) -> Optional[str]:
+        """Return the selected report CSV id, if any."""
+        sel = self.tv_report_csvs.selection()
+        if sel:
+            return sel[0]
+        return None
 
     # ---- View helpers ----
     def _set_initial_sashes(self):
@@ -1778,6 +3004,8 @@ class App(tk.Tk):
                                             filetypes=[("Session JSON","*.json")])
         if not path: return
         data = {
+            "app_version": APP_VERSION,
+            "session_schema_version": SESSION_SCHEMA_VERSION,
             "power_column_map": self.power_column_map,
             "module_paths": list(_EXTRA_MODULE_PATHS),
             "files": [asdict(fr) for fr in self.files.values()],
@@ -1819,6 +3047,13 @@ class App(tk.Tk):
                 "ivt_group_display": self.ivt_group_display.get(),
                 "ovp_group_display": self.ovp_group_display.get(),
                 "controls_visible": self.controls_visible.get(),
+            },
+            "report": {
+                "scans": [asdict(sr) for sr in self.report_scans.values()],
+                "csvs": [asdict(cr) for cr in self.report_csvs.values()],
+                "segment_selection": dict(self.report_segment_selection),
+                "lamp_image_path": self.report_lamp_image_path_var.get(),
+                "axes_image_path": self.report_axes_image_path_var.get(),
             }
         }
         with open(path, "w") as fd: json.dump(data, fd, indent=2)
@@ -1842,6 +3077,26 @@ class App(tk.Tk):
             gr.file_ids = set(g.get("file_ids", []))
             gr.associations = {k: set(v) for k,v in g.get("associations", {}).items()}
             self.groups[gr.group_id] = gr
+        report = data.get("report", {})
+        self.report_scans = {}
+        for sr in report.get("scans", []):
+            rec = ReportScanRecord(**sr)
+            if isinstance(rec.phase_tags, dict):
+                rec.phase_tags = {int(k): v for k, v in rec.phase_tags.items()}
+            self.report_scans[rec.scan_id] = rec
+        self.report_csvs = {}
+        for cr in report.get("csvs", []):
+            rec = ReportCsvRecord(**cr)
+            self.report_csvs[rec.csv_id] = rec
+        allowed_segment_keys = {k for k, _ in REPORT_SEGMENT_TYPES}
+        self.report_segment_selection = {
+            str(k): str(v)
+            for k, v in report.get("segment_selection", {}).items()
+            if str(k) in allowed_segment_keys
+        }
+        self.report_lamp_image_path_var.set(str(report.get("lamp_image_path", "") or ""))
+        self.report_axes_image_path_var.set(str(report.get("axes_image_path", "") or ""))
+        self._report_selected_scan_id = None
         c = data.get("controls", {})
         def set_if(k,var):
             if k in c: var.set(c[k])
@@ -1882,6 +3137,9 @@ class App(tk.Tk):
         self._refresh_files_tv()
         self._refresh_groups_tv()
         self._refresh_display_mappings()
+        self._refresh_report_scans_tv()
+        self._refresh_report_csvs_tv()
+        self._refresh_report_segment_selectors()
         self.on_toggle_controls()
         self._invalidate_aligned_cache()
         self._last_analyzed_gid = self._current_ovp_group_id()
@@ -3331,6 +4589,20 @@ class App(tk.Tk):
         i=1
         while f"G{i:03d}" in self.groups: i+=1
         return f"G{i:03d}"
+
+    def _next_report_scan_id(self) -> str:
+        """Return the next available report scan id (RS###)."""
+        i = 1
+        while f"RS{i:03d}" in self.report_scans:
+            i += 1
+        return f"RS{i:03d}"
+
+    def _next_report_csv_id(self) -> str:
+        """Return the next available report CSV id (RC###)."""
+        i = 1
+        while f"RC{i:03d}" in self.report_csvs:
+            i += 1
+        return f"RC{i:03d}"
 
 # ------------------------------------------------------------------
 # Association dialog (friendly labels; shows full mapping)

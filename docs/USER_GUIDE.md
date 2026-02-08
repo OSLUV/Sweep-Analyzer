@@ -11,6 +11,31 @@
 - Associations define which SW3 files align against which power logs.
 - Alignment is done by nearest timestamps with a tolerance.
 
+**Report Builder Workflow (Tab 2)**
+1. Open `Report Builder` from the top-level tabs.
+2. In `Inputs`, add one or more SW3 files.
+3. Add report CSV files and assign each CSV role (`Power Log`, `Power Waveform`, or `Power Factor/Current`).
+4. Optionally rename records to clean labels that match reporting output.
+5. Set report image assets:
+   - `Lamp photo` (product image)
+   - `Axes photo` (product image with coordinate axes)
+6. Open `Phases & Segments`:
+   - select a scan from the scan picker,
+   - review inferred scan role (`Complete Dataset`, `Main Scan`, etc.),
+   - review/edit per-phase tags.
+7. Use `Segment Selection` to pick exactly which duplicate phase instance to use for:
+   - warm-up
+   - spectrum point
+   - R2 pullback
+   - loose spectrometer scan
+   - tight spectrometer scan
+8. Use `Auto Latest` or `Auto Selected Scan` as a baseline, then override manually as needed.
+
+**Warm-up Selection Rule**
+- Warm-up auto-selection prefers the latest approximately 1-hour warm-up segment.
+- If no approximately 1-hour segment exists, it falls back to the latest available warm-up segment.
+- This supports workflows where a full seasoned run and a short verification run exist together.
+
 **Intensity vs Time (IVT)**
 - Choose a single SW3 file or a group.
 - Optional normalization to 1 m applies inverse‑square scaling.
@@ -59,3 +84,5 @@
 - If spectral inspection opens nothing, the selected rows may not contain spectral data.
 - If analysis is still slow on very large groups, increase `Resample (s)` to reduce the number of power points before smoothing/alignment.
 - Reloading files invalidates old aligned cache and automatically queues a background reprocess of the last analyzed/active group.
+- If phases are not visible in `Phases & Segments`, choose the scan from the scan picker at the top of that tab.
+- If duplicate phase candidates are present, explicitly choose each segment in `Segment Selection` instead of relying only on defaults.

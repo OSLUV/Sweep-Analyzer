@@ -29,7 +29,16 @@ python gui.py
 ```bash
 ./venv/bin/python -m unittest discover -s tests -v
 ```
+- Run report fixture validation when report-builder changes are involved:
+```bash
+./venv/bin/python scripts/validate_aerolamp_fixture.py --dataset-dir "OSLUV Data/Aerolamp"
+```
 - Use the Open Excimer dataset tuning script to validate long-run behavior:
 ```bash
 ./venv/bin/python scripts/tune_open_excimer.py --dataset-dir "OSLUV Data/OSLUV Experiments/Open Excimer"
 ```
+
+**Versioning**
+- App version is defined in `gui.py` (`APP_VERSION`).
+- Session files include `app_version` and `session_schema_version`.
+- For major feature releases, bump major semver and tag (`v<major>.<minor>.<patch>`).

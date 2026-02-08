@@ -37,3 +37,11 @@ SW3/eegbin files store optical irradiance measurements captured by a goniometer.
 **Session JSON**
 - Saved via the GUI and captures files, groups, associations, trims, and control values.
 - Stored as a single JSON file; see `on_save_session` in `gui.py` for field layout.
+- Includes top-level metadata:
+  - `app_version`
+  - `session_schema_version`
+- Includes report-builder state:
+  - `report.scans`: serialized `ReportScanRecord` entries
+  - `report.csvs`: serialized `ReportCsvRecord` entries
+  - `report.segment_selection`: canonical selected segment ids per segment type
+  - `report.lamp_image_path` and `report.axes_image_path`

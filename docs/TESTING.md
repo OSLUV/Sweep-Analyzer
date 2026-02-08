@@ -10,6 +10,27 @@ Current tests cover:
 - explicit NaN gap insertion for plotting
 - power preprocessing behavior across data outages
 - dataset smoke check for Open Excimer folder presence
+- report phase tagging and scan-role inference heuristics
+- warm-up segment auto-selection behavior for duplicate/partial runs
+
+Run only report-tagging regressions:
+
+```bash
+./venv/bin/python -m unittest tests/test_report_phase_tagging.py -v
+```
+
+Run Aerolamp end-to-end fixture validation (expects full local fixture folder):
+
+```bash
+./venv/bin/python scripts/validate_aerolamp_fixture.py \
+  --dataset-dir "OSLUV Data/Aerolamp"
+```
+
+The fixture validator checks:
+- expected SW3/CSV/image source files exist
+- expected generated outputs exist (`.html`, `.ies`, spectrum `.csv`)
+- output marker strings are present
+- inferred phase tags and scan roles match expected Aerolamp baselines
 
 **Dataset Tuning Workflow**
 Use the Open Excimer long-run data to derive suggested GUI defaults:

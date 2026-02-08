@@ -17,6 +17,12 @@ Includes grouping, many‑to‑many associations, global **trimming (HH:MM:SS)**
 - Power log gaps render as blank intervals (no misleading flat connectors)
 - IVT, OVP, decay overlay, and correlation/scatter plots
 - Session save/load with full UI state
+- Dedicated Report Builder tab for report preparation:
+  - import one or more SW3 scans and CSVs
+  - auto-tag warm-up / spectrum / R2 / loose web / tight web phases
+  - classify runs as `Complete Dataset`, `Main Scan`, `Burn-in Scan`, etc.
+  - pick duplicate segment instances explicitly (latest or selected-run auto-pick)
+  - attach lamp and axes image assets for downstream report generation
 
 ## Docs
 - [User Guide](docs/USER_GUIDE.md)
@@ -24,6 +30,7 @@ Includes grouping, many‑to‑many associations, global **trimming (HH:MM:SS)**
 - [File Formats](docs/FILE_FORMATS.md)
 - [Development](docs/DEVELOPMENT.md)
 - [Testing](docs/TESTING.md)
+- [Changelog](CHANGELOG.md)
 
 ## Run locally
 
@@ -40,6 +47,13 @@ python gui.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
 
+Report Builder fixture validation (Aerolamp):
+
+```bash
+./venv/bin/python scripts/validate_aerolamp_fixture.py \
+  --dataset-dir "OSLUV Data/Aerolamp"
+```
+
 ## Tune on Open Excimer Dataset
 
 ```bash
@@ -52,15 +66,15 @@ python gui.py
 
 ## Continuous Integration (GitHub Actions)
 
-This repo includes a cross‑platform workflow to build on **Ubuntu, Windows, and macOS (Intel & Apple Silicon)** and attach artifacts to releases when you push a tag starting with `v` (e.g. `v1.0.0`).  
+This repo includes a cross‑platform workflow to build on **Ubuntu, Windows, and macOS (Intel & Apple Silicon)** and attach artifacts to releases when you push a tag starting with `v` (e.g. `v2.0.0`).  
 See [`.github/workflows/build.yml`](.github/workflows/build.yml) for details.
 
 ### Usage
 1. Commit and push to `main` to build and upload CI artifacts.
 2. Create a version tag to publish a release:
    ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v2.0.0
+   git push origin v2.0.0
    ```
 
 ### macOS Gatekeeper
