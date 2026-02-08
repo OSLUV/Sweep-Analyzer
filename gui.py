@@ -28,6 +28,7 @@ Notes
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -45,9 +46,11 @@ matplotlib.use("TkAgg")
 from matplotlib import pyplot as plt
 from matplotlib import colors as mpl_colors
 from matplotlib import colormaps as mpl_colormaps
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
 
 try:
     from scipy import stats as scipy_stats
@@ -556,7 +559,7 @@ def darken(color, amount=0.35):
 # Unit conversion: 1 W/m^2 = 100 µW/cm^2
 WM2_TO_UW_CM2 = 100.0
 APP_NAME = "SW3 + Power Analyzer"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 SESSION_SCHEMA_VERSION = 2
 
 # Report Builder roles/tags
@@ -599,6 +602,93 @@ REPORT_SEGMENT_TYPES: List[Tuple[str, str]] = [
 ]
 WARMUP_FULL_HOUR_MIN_H = 0.90
 WARMUP_FULL_HOUR_MAX_H = 1.20
+REPORT_METADATA_FIELDS: List[Tuple[str, str, str]] = [
+    ("reporting_name", "Reporting Name", ""),
+    ("reporting_subtitle", "Reporting Subtitle", ""),
+    ("catalog_id", "Catalog ID", ""),
+    ("revision_name", "Revision Name", "R00"),
+    ("revision_date", "Revision Date", ""),
+    ("revision_notes", "Revision Notes", "Initial Version"),
+    ("acq_name", "Article Name", ""),
+    ("acq_manufacturer", "Manufacturer", ""),
+    ("acq_model_number", "Model Number", ""),
+    ("acq_serial_number", "Article Serial Number", ""),
+    ("acq_production_date", "Production Date", ""),
+    ("osluv_serial_number", "OSLUV Control Number", ""),
+    ("acq_date", "Acquisition Date", ""),
+    ("acq_price", "Acquisition Price", ""),
+    ("acq_method", "Acquisition Method", ""),
+    ("supply_style", "Supply Style", ""),
+    ("wall_power_type", "Wall Power Type", ""),
+    ("wall_power_w", "Wall Power (W)", ""),
+    ("consumer_cost", "Consumer Cost", ""),
+    ("psu_desc", "PSU Description", ""),
+    ("psu_manuf", "PSU Manufacturer", ""),
+    ("psu_model", "PSU Model", ""),
+    ("psu_serial", "PSU Serial Number", ""),
+    ("psu_osluv_serial", "PSU OSLUV Control Number", ""),
+]
+REPORT_METADATA_DEFAULTS: Dict[str, str] = {k: d for k, _label, d in REPORT_METADATA_FIELDS}
+REPORT_METADATA_LABELS: Dict[str, str] = {k: label for k, label, _d in REPORT_METADATA_FIELDS}
+REPORT_METADATA_SECTIONS: List[Tuple[str, List[str]]] = [
+    ("Report Identity", ["reporting_name", "reporting_subtitle", "catalog_id", "revision_name", "revision_date", "revision_notes"]),
+    (
+        "Article Details",
+        [
+            "acq_name",
+            "acq_manufacturer",
+            "acq_model_number",
+            "acq_serial_number",
+            "acq_production_date",
+            "osluv_serial_number",
+            "acq_date",
+            "acq_price",
+            "acq_method",
+        ],
+    ),
+    ("Electrical Setup", ["supply_style", "wall_power_type", "wall_power_w", "consumer_cost"]),
+    ("Power Supply", ["psu_desc", "psu_manuf", "psu_model", "psu_serial", "psu_osluv_serial"]),
+]
+REPORT_COMMENT_FIELDS: List[Tuple[str, str]] = [
+    ("general_notes", "General Notes"),
+    ("warmup_note", "Warm-Up Note"),
+    ("burnin_note", "Burn-In Note"),
+    ("power_note", "Electrical Notes"),
+    ("apparatus_note", "Measurement Apparatus Notes"),
+]
+REPORT_EXPOSURE_MODES: List[str] = [
+    "Unweighted",
+    "IES/ANSI Eye",
+    "IES/ANSI Skin",
+    "IEC",
+]
+REPORT_OPTICAL_POWER_MODES: List[str] = [
+    "Band",
+    "Full spectrum",
+]
+REPORT_SPECTRAL_POWER_BINS: List[Tuple[str, Tuple[float, float]]] = [
+    ("Far UVC", (200.0, 240.0)),
+    ("High-S(lambda) UVC", (240.0, 300.0)),
+    ("UVC", (200.0, 280.0)),
+    ("UVB", (280.0, 315.0)),
+    ("UVA", (315.0, 400.0)),
+    ("Total UV", (200.0, 400.0)),
+]
+# Coarse fallback S(lambda) anchors from legacy reporting standards tables.
+REPORT_EXPOSURE_WEIGHT_CURVES: Dict[str, Dict[str, List[float]]] = {
+    "IES/ANSI Eye": {
+        "nm": [200, 210, 220, 222, 230, 240, 250, 260, 270, 280, 290, 300, 305, 310, 315, 320, 330, 340, 360, 380, 400],
+        "val": [0.001845, 0.002930, 0.013712, 0.018668, 0.064134, 0.300000, 0.430000, 0.650000, 1.000000, 0.880000, 0.640000, 0.300000, 0.060000, 0.015000, 0.003000, 0.001000, 0.000410, 0.000280, 0.000130, 0.000064, 0.000030],
+    },
+    "IES/ANSI Skin": {
+        "nm": [200, 210, 220, 222, 230, 240, 250, 260, 270, 280, 290, 300, 305, 310, 315, 320, 330, 340, 360, 380, 400],
+        "val": [0.000300, 0.001196, 0.004758, 0.006270, 0.018919, 0.075232, 0.300000, 0.300000, 0.300000, 0.300000, 0.300000, 0.300000, 0.060000, 0.015000, 0.003000, 0.001000, 0.000410, 0.000280, 0.000130, 0.000064, 0.000030],
+    },
+    "IEC": {
+        "nm": [200, 210, 220, 222, 230, 240, 250, 260, 270, 280, 290, 300, 305, 310, 315, 320, 330, 340, 360, 380, 400],
+        "val": [0.030000, 0.075000, 0.120000, 0.131203, 0.190000, 0.300000, 0.430000, 0.650000, 1.000000, 0.880000, 0.640000, 0.300000, 0.060000, 0.015000, 0.003000, 0.001000, 0.000410, 0.000280, 0.000130, 0.000064, 0.000030],
+    },
+}
 
 
 def suggest_report_phase_tag(phase: Dict[str, object]) -> str:
@@ -666,6 +756,73 @@ def choose_latest_full_hour_warmup_segment_id(candidates: List[Dict[str, object]
     best = max(pool, key=lambda c: (float(c.get("start_ts", -1.0)), int(c.get("phase_idx", -1))))
     seg_id = best.get("segment_id")
     return str(seg_id) if seg_id else None
+
+
+def choose_pattern_display_planes(
+    roll_values: List[float],
+    selected_index: int,
+) -> Tuple[List[float], List[float], int]:
+    """Return normalized roll list plus plotted planes (0deg, 90deg, and selected)."""
+    normalized: List[float] = []
+    for value in roll_values:
+        try:
+            fv = float(value)
+        except Exception:
+            continue
+        if not np.isfinite(fv):
+            continue
+        normalized.append(fv)
+    normalized = sorted(set(normalized))
+    if not normalized:
+        return [], [], 0
+
+    idx = max(0, min(int(selected_index), len(normalized) - 1))
+    selected_plane = normalized[idx]
+
+    planes: List[float] = []
+    for target in (0.0, 90.0):
+        nearest = min(normalized, key=lambda v: abs(v - target))
+        if nearest not in planes:
+            planes.append(nearest)
+    if selected_plane not in planes:
+        planes.append(selected_plane)
+    if not planes:
+        planes = [normalized[0]]
+    return normalized, planes, idx
+
+
+def log_interp_clamped(
+    x: float,
+    xp: np.ndarray,
+    fp: np.ndarray,
+    *,
+    zero_at_or_above: Optional[float] = None,
+) -> float:
+    """Log-space interpolate fp(xp) with endpoint clamping and optional high-end cutoff."""
+    xv = float(x)
+    if zero_at_or_above is not None and xv >= float(zero_at_or_above):
+        return 0.0
+    xs = np.asarray(xp, dtype=float)
+    ys = np.asarray(fp, dtype=float)
+    if xs.size == 0 or ys.size == 0:
+        return 0.0
+    n = min(xs.size, ys.size)
+    xs = xs[:n]
+    ys = ys[:n]
+    mask = np.isfinite(xs) & np.isfinite(ys) & (ys > 0)
+    xs = xs[mask]
+    ys = ys[mask]
+    if xs.size == 0:
+        return 0.0
+    order = np.argsort(xs)
+    xs = xs[order]
+    ys = ys[order]
+    if xv <= float(xs[0]):
+        return float(ys[0])
+    if xv >= float(xs[-1]):
+        return float(ys[-1])
+    log_y = np.log10(np.clip(ys, 1e-12, None))
+    return float(np.power(10.0, np.interp(xv, xs, log_y)))
 
 
 def suggest_report_scan_role(phases: List[Dict[str, object]]) -> str:
@@ -784,6 +941,16 @@ class App(tk.Tk):
             key: {} for key, _ in REPORT_SEGMENT_TYPES
         }
         self._report_segment_combos: Dict[str, ttk.Combobox] = {}
+        self._report_sweep_cache: Dict[str, object] = {}
+        self._report_preview_plots: Dict[str, Dict[str, object]] = {}
+        self._report_comment_widgets: Dict[str, scrolledtext.ScrolledText] = {}
+        self._report_overview_text: Optional[scrolledtext.ScrolledText] = None
+        self._report_weight_tables: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._report_weight_table_source: Optional[str] = None
+        self._report_spectral_cache: Dict[str, object] = {}
+        self._report_pattern_cache: Dict[str, object] = {}
+        self._report_pattern_slider: Optional[tk.Scale] = None
+        self._report_pattern_slider_syncing = False
 
         # display maps for friendly names
         self._sw3_display_to_id: Dict[str, str] = {}
@@ -907,6 +1074,18 @@ class App(tk.Tk):
             key: tk.StringVar(self, value="")
             for key, _ in REPORT_SEGMENT_TYPES
         }
+        self.report_meta_vars: Dict[str, tk.StringVar] = {
+            key: tk.StringVar(self, value=default)
+            for key, _label, default in REPORT_METADATA_FIELDS
+        }
+        self.report_exposure_mode_var = tk.StringVar(self, value="IEC")
+        self.report_optical_power_mode_var = tk.StringVar(self, value="Band")
+        self.report_optical_power_min_nm_var = tk.StringVar(self, value="200")
+        self.report_optical_power_max_nm_var = tk.StringVar(self, value="230")
+        self.report_pattern_plane_idx_var = tk.IntVar(self, value=0)
+        self.report_pattern_plane_label_var = tk.StringVar(self, value="No plane rows available.")
+        self.report_preview_status_var = tk.StringVar(self, value="Preview not generated.")
+        self.report_electrical_summary_var = tk.StringVar(self, value="No electrical summary yet.")
 
     # ---- UI ----
     def _build_ui(self):
@@ -1351,8 +1530,12 @@ class App(tk.Tk):
 
         tab_inputs = ttk.Frame(report_nb, padding=(4, 4))
         tab_phase = ttk.Frame(report_nb, padding=(4, 4))
+        tab_meta = ttk.Frame(report_nb, padding=(4, 4))
+        tab_preview = ttk.Frame(report_nb, padding=(4, 4))
         report_nb.add(tab_inputs, text="Inputs")
         report_nb.add(tab_phase, text="Phases & Segments")
+        report_nb.add(tab_meta, text="Metadata")
+        report_nb.add(tab_preview, text="Preview")
 
         h_pane = ttk.Panedwindow(tab_inputs, orient=tk.HORIZONTAL)
         h_pane.pack(fill=tk.BOTH, expand=True)
@@ -1680,6 +1863,1985 @@ class App(tk.Tk):
             style="Hint.TLabel",
         ).pack(anchor="w", padx=4, pady=(0, 6))
         self._refresh_report_segment_selectors()
+        self._build_report_metadata_tab(tab_meta)
+        self._build_report_preview_tab(tab_preview)
+
+    def _build_report_metadata_tab(self, parent):
+        """Build report metadata/notes editor as its own top-level tab."""
+        meta_frame = ttk.LabelFrame(parent, text="Report Metadata & Notes")
+        meta_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        meta_toolbar = ttk.Frame(meta_frame)
+        meta_toolbar.pack(fill=tk.X, padx=4, pady=(6, 4))
+        ttk.Button(
+            meta_toolbar,
+            text="Use Selected Scan Label",
+            style="Toolbar.TButton",
+            command=self.on_report_seed_metadata_from_selected_scan,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            meta_toolbar,
+            text="Edit metadata and section notes here. Analysis controls and plots are in the Preview tab.",
+            style="Hint.TLabel",
+        ).pack(side=tk.LEFT)
+
+        meta_container = ttk.Frame(meta_frame)
+        meta_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        meta_canvas = tk.Canvas(meta_container, highlightthickness=0)
+        meta_vsb = ttk.Scrollbar(meta_container, orient="vertical", command=meta_canvas.yview)
+        meta_canvas.configure(yscrollcommand=meta_vsb.set)
+        meta_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        meta_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        form = ttk.Frame(meta_canvas)
+        form_window = meta_canvas.create_window((0, 0), window=form, anchor="nw")
+
+        def _sync_meta_scroll(_event=None):
+            meta_canvas.configure(scrollregion=meta_canvas.bbox("all"))
+
+        def _sync_form_width(event):
+            try:
+                meta_canvas.itemconfigure(form_window, width=event.width)
+            except Exception:
+                pass
+
+        form.bind("<Configure>", _sync_meta_scroll)
+        meta_canvas.bind("<Configure>", _sync_form_width)
+
+        self._report_comment_widgets = {}
+        row = 0
+        for section_name, field_keys in REPORT_METADATA_SECTIONS:
+            ttk.Label(form, text=section_name, font=("TkDefaultFont", 10, "bold")).grid(
+                row=row,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                padx=2,
+                pady=(8, 4),
+            )
+            row += 1
+            for key in field_keys:
+                ttk.Label(form, text=f"{REPORT_METADATA_LABELS.get(key, key)}:").grid(
+                    row=row,
+                    column=0,
+                    sticky="w",
+                    padx=(4, 6),
+                    pady=1,
+                )
+                ttk.Entry(
+                    form,
+                    textvariable=self.report_meta_vars[key],
+                ).grid(row=row, column=1, sticky="ew", padx=(0, 2), pady=1)
+                row += 1
+
+        ttk.Label(form, text="Section Notes", font=("TkDefaultFont", 10, "bold")).grid(
+            row=row,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=2,
+            pady=(10, 4),
+        )
+        row += 1
+        for key, label in REPORT_COMMENT_FIELDS:
+            ttk.Label(form, text=f"{label}:").grid(
+                row=row,
+                column=0,
+                sticky="nw",
+                padx=(4, 6),
+                pady=(2, 2),
+            )
+            txt = scrolledtext.ScrolledText(form, height=3, wrap=tk.WORD)
+            txt.grid(row=row, column=1, sticky="ew", padx=(0, 2), pady=(2, 2))
+            self._report_comment_widgets[key] = txt
+            row += 1
+        form.columnconfigure(1, weight=1)
+
+    def _build_report_preview_tab(self, parent):
+        """Build report previews as a dedicated top-level tab."""
+        preview_frame = ttk.LabelFrame(parent, text="Report Analysis Preview")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        preview_toolbar = ttk.Frame(preview_frame)
+        preview_toolbar.pack(fill=tk.X, padx=4, pady=(6, 4))
+        ttk.Button(
+            preview_toolbar,
+            text="Refresh Previews",
+            style="Primary.TButton",
+            command=self.on_report_refresh_previews,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(preview_toolbar, text="Exposure weighting:").pack(side=tk.LEFT, padx=(10, 4))
+        self.cb_report_exposure_mode = ttk.Combobox(
+            preview_toolbar,
+            state="readonly",
+            width=16,
+            values=REPORT_EXPOSURE_MODES,
+            textvariable=self.report_exposure_mode_var,
+        )
+        self.cb_report_exposure_mode.pack(side=tk.LEFT, padx=(0, 6))
+        self.cb_report_exposure_mode.bind("<<ComboboxSelected>>", lambda _e: self.on_report_exposure_mode_changed())
+        ttk.Label(preview_toolbar, text="Optical power band (nm):").pack(side=tk.LEFT, padx=(10, 4))
+        self.cb_report_optical_power_mode = ttk.Combobox(
+            preview_toolbar,
+            state="readonly",
+            width=13,
+            values=REPORT_OPTICAL_POWER_MODES,
+            textvariable=self.report_optical_power_mode_var,
+        )
+        self.cb_report_optical_power_mode.pack(side=tk.LEFT, padx=(0, 4))
+        self.cb_report_optical_power_mode.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self.on_report_optical_power_settings_changed(),
+        )
+        self.ent_report_optical_power_min = ttk.Entry(
+            preview_toolbar,
+            textvariable=self.report_optical_power_min_nm_var,
+            width=6,
+        )
+        self.ent_report_optical_power_min.pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(preview_toolbar, text="to").pack(side=tk.LEFT, padx=(0, 2))
+        self.ent_report_optical_power_max = ttk.Entry(
+            preview_toolbar,
+            textvariable=self.report_optical_power_max_nm_var,
+            width=6,
+        )
+        self.ent_report_optical_power_max.pack(side=tk.LEFT, padx=(0, 4))
+        self.ent_report_optical_power_min.bind("<Return>", lambda _e: self.on_report_optical_power_settings_changed())
+        self.ent_report_optical_power_max.bind("<Return>", lambda _e: self.on_report_optical_power_settings_changed())
+        ttk.Button(
+            preview_toolbar,
+            text="200-230",
+            style="Toolbar.TButton",
+            command=lambda: self.on_report_set_optical_power_preset(200.0, 230.0),
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(
+            preview_toolbar,
+            text="200-300",
+            style="Toolbar.TButton",
+            command=lambda: self.on_report_set_optical_power_preset(200.0, 300.0),
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Separator(preview_toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(
+            preview_toolbar,
+            text="Open Spectral Table",
+            style="Toolbar.TButton",
+            command=self.on_report_open_spectral_table_popout,
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(
+            preview_toolbar,
+            text="Open Spectral Linear",
+            style="Toolbar.TButton",
+            command=self.on_report_open_spectral_linear_popout,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            preview_toolbar,
+            text="Open Spectral Log",
+            style="Toolbar.TButton",
+            command=self.on_report_open_spectral_log_popout,
+        ).pack(side=tk.LEFT, padx=2)
+        self._sync_report_optical_power_controls()
+        ttk.Label(preview_toolbar, textvariable=self.report_preview_status_var, style="Hint.TLabel").pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+
+        preview_nb = ttk.Notebook(preview_frame)
+        preview_nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 6))
+
+        tab_overview = ttk.Frame(preview_nb, padding=(4, 4))
+        preview_nb.add(tab_overview, text="Overview")
+        self._report_overview_text = scrolledtext.ScrolledText(tab_overview, wrap=tk.WORD, height=14)
+        self._report_overview_text.pack(fill=tk.BOTH, expand=True)
+        self._set_readonly_text_widget(self._report_overview_text, "Preview not generated yet.")
+
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "pattern", "Radiant Intensity Pattern"), text="Pattern")
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "warmup", "Warm-Up Behavior"), text="Warm-Up")
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "burnin", "Burn-In Behavior"), text="Burn-In")
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "spectral", "Spectral Output"), text="Spectral")
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "exposure", "Exposure Limits (Unweighted)"), text="Exposure")
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "roll", "Roll-Dependence"), text="Roll")
+        preview_nb.add(self._build_report_preview_plot_tab(preview_nb, "r2", "R² Validation"), text="R²")
+
+        tab_electrical = self._build_report_preview_plot_tab(preview_nb, "electrical", "Electrical Characteristics")
+        ttk.Label(
+            tab_electrical,
+            textvariable=self.report_electrical_summary_var,
+            style="Hint.TLabel",
+            justify=tk.LEFT,
+            anchor="w",
+        ).pack(fill=tk.X, expand=False, pady=(2, 0))
+        preview_nb.add(tab_electrical, text="Electrical")
+
+    def _build_report_preview_plot_tab(self, parent, key: str, title: str):
+        """Create one preview tab with a Matplotlib canvas and message line."""
+        tab = ttk.Frame(parent, padding=(4, 4))
+        if key == "spectral":
+            fig_size = (8.0, 6.2)
+        elif key == "electrical":
+            fig_size = (7.6, 4.8)
+        else:
+            fig_size = (7.0, 3.3)
+        fig = Figure(figsize=fig_size, dpi=100, tight_layout=True)
+        toolbar_shell = ttk.Frame(tab, height=36)
+        toolbar_shell.pack_propagate(False)
+        toolbar_shell.pack(fill=tk.X, expand=False, pady=(0, 2))
+        canvas = FigureCanvasTkAgg(fig, master=tab)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(2, 2))
+        toolbar_host = ttk.Frame(toolbar_shell)
+        toolbar_host.pack(fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_host, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side=tk.LEFT)
+        if key == "spectral":
+            ttk.Button(
+                toolbar_host,
+                text="Open Table",
+                style="Toolbar.TButton",
+                command=self.on_report_open_spectral_table_popout,
+            ).pack(side=tk.LEFT, padx=(10, 2))
+            ttk.Button(
+                toolbar_host,
+                text="Open Linear",
+                style="Toolbar.TButton",
+                command=self.on_report_open_spectral_linear_popout,
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                toolbar_host,
+                text="Open Log",
+                style="Toolbar.TButton",
+                command=self.on_report_open_spectral_log_popout,
+            ).pack(side=tk.LEFT, padx=2)
+        if key == "pattern":
+            ttk.Label(toolbar_host, text="Custom plane:").pack(side=tk.LEFT, padx=(10, 4))
+            self._report_pattern_slider = tk.Scale(
+                toolbar_host,
+                from_=0,
+                to=0,
+                variable=self.report_pattern_plane_idx_var,
+                orient=tk.HORIZONTAL,
+                resolution=1,
+                length=170,
+                showvalue=False,
+                state=tk.DISABLED,
+                highlightthickness=0,
+                command=self.on_report_pattern_plane_slider_changed,
+            )
+            self._report_pattern_slider.pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Label(
+                toolbar_host,
+                textvariable=self.report_pattern_plane_label_var,
+                style="Hint.TLabel",
+                width=18,
+            ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(
+            toolbar_host,
+            text="Use toolbar controls to pan, box-zoom, reset view, and save preview images.",
+            style="Hint.TLabel",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        msg_var = tk.StringVar(self, value="No preview data yet.")
+        ttk.Label(tab, textvariable=msg_var, style="Hint.TLabel", justify=tk.LEFT, wraplength=1000).pack(anchor="w")
+        self._report_preview_plots[key] = {
+            "figure": fig,
+            "canvas": canvas,
+            "toolbar": toolbar,
+            "message_var": msg_var,
+        }
+        return tab
+
+    def _set_readonly_text_widget(self, widget: Optional[scrolledtext.ScrolledText], text: str):
+        """Replace text in a read-only text widget."""
+        if widget is None:
+            return
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        widget.configure(state=tk.DISABLED)
+
+    def _get_report_comment_text(self, key: str) -> str:
+        """Read report note text for a given note key."""
+        widget = self._report_comment_widgets.get(key)
+        if widget is None:
+            return ""
+        return widget.get("1.0", tk.END).strip()
+
+    def _set_report_comment_text(self, key: str, text: str):
+        """Set report note text for a given note key."""
+        widget = self._report_comment_widgets.get(key)
+        if widget is None:
+            return
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text or "")
+
+    def _collect_report_comments(self) -> Dict[str, str]:
+        """Snapshot comment fields from the metadata editor."""
+        return {key: self._get_report_comment_text(key) for key, _label in REPORT_COMMENT_FIELDS}
+
+    def _apply_report_comments(self, data: Dict[str, object]):
+        """Load comment fields into metadata editor widgets."""
+        for key, _label in REPORT_COMMENT_FIELDS:
+            self._set_report_comment_text(key, str(data.get(key, "") or ""))
+
+    def _collect_report_metadata(self) -> Dict[str, str]:
+        """Snapshot metadata entry fields."""
+        return {key: var.get().strip() for key, var in self.report_meta_vars.items()}
+
+    def _apply_report_metadata(self, data: Dict[str, object]):
+        """Load metadata entry fields from persisted data."""
+        for key, _label, default in REPORT_METADATA_FIELDS:
+            self.report_meta_vars[key].set(str(data.get(key, default) or ""))
+
+    def on_report_seed_metadata_from_selected_scan(self):
+        """Populate key metadata fields from the selected scan label if empty."""
+        sid = self._current_report_scan_id()
+        if not sid:
+            messagebox.showinfo("Report Metadata", "Select a scan first.")
+            return
+        rec = self.report_scans.get(sid)
+        if rec is None:
+            return
+        if not self.report_meta_vars["reporting_name"].get().strip():
+            self.report_meta_vars["reporting_name"].set(rec.label)
+        if not self.report_meta_vars["acq_name"].get().strip():
+            self.report_meta_vars["acq_name"].set(rec.label)
+        if not self.report_meta_vars["catalog_id"].get().strip():
+            self.report_meta_vars["catalog_id"].set("UNASSIGNED")
+        self._set_status("Seeded report metadata from selected scan.")
+
+    def on_report_exposure_mode_changed(self):
+        """Handle exposure weighting mode changes."""
+        mode = self.report_exposure_mode_var.get().strip() or "Unweighted"
+        self._set_status(f"Exposure weighting set to {mode}.")
+        if self._report_preview_plots:
+            self.on_report_refresh_previews()
+
+    def _sync_report_optical_power_controls(self):
+        """Enable/disable optical band entry fields based on integration mode."""
+        mode = self.report_optical_power_mode_var.get().strip() or "Band"
+        state = "normal" if mode == "Band" else "disabled"
+        try:
+            self.ent_report_optical_power_min.configure(state=state)
+            self.ent_report_optical_power_max.configure(state=state)
+        except Exception:
+            pass
+
+    def on_report_optical_power_settings_changed(self):
+        """Handle optical power integration control updates."""
+        mode = self.report_optical_power_mode_var.get().strip() or "Band"
+        self._sync_report_optical_power_controls()
+        if mode == "Full spectrum":
+            self._set_status("Optical power integration set to full spectrum.")
+        else:
+            self._set_status(
+                f"Optical power integration band set to "
+                f"{self.report_optical_power_min_nm_var.get().strip()}-"
+                f"{self.report_optical_power_max_nm_var.get().strip()} nm."
+            )
+        if self._report_preview_plots:
+            self.on_report_refresh_previews()
+
+    def on_report_set_optical_power_preset(self, lo_nm: float, hi_nm: float):
+        """Apply a wavelength-band preset for optical power integration."""
+        self.report_optical_power_mode_var.set("Band")
+        self.report_optical_power_min_nm_var.set(f"{float(lo_nm):.1f}".rstrip("0").rstrip("."))
+        self.report_optical_power_max_nm_var.set(f"{float(hi_nm):.1f}".rstrip("0").rstrip("."))
+        self.on_report_optical_power_settings_changed()
+
+    def _report_pattern_cache_signature(
+        self,
+        rows: List[object],
+        used: List[str],
+    ) -> Tuple[Tuple[str, ...], int, Optional[float], Optional[float]]:
+        """Return a compact signature for cached pattern preprocessing."""
+        used_sig = tuple(sorted(set(str(x) for x in used)))
+        if not rows:
+            return used_sig, 0, None, None
+        first_ts = float(getattr(rows[0], "timestamp", 0.0) or 0.0)
+        last_ts = float(getattr(rows[-1], "timestamp", 0.0) or 0.0)
+        return used_sig, len(rows), first_ts, last_ts
+
+    def _build_report_pattern_cache(
+        self,
+        rows: List[object],
+        used: List[str],
+    ) -> Dict[str, object]:
+        """Precompute roll/yaw traces for responsive custom-plane slider updates."""
+        sig = self._report_pattern_cache_signature(rows, used)
+        roll_yaw_map: Dict[float, Dict[float, List[float]]] = {}
+        for row in rows:
+            coords = getattr(row, "coords", None)
+            if coords is None:
+                continue
+            roll = getattr(coords, "roll_deg", None)
+            yaw = getattr(coords, "yaw_deg", None)
+            if roll is None or yaw is None:
+                continue
+            roll_f = float(roll)
+            yaw_f = float(yaw)
+            if not (np.isfinite(roll_f) and np.isfinite(yaw_f)):
+                continue
+            val = self._row_intensity_uW_cm2(row, normalize_to_1m=True)
+            if not np.isfinite(val):
+                continue
+            yaw_bins = roll_yaw_map.setdefault(roll_f, {})
+            yaw_bins.setdefault(yaw_f, []).append(float(val))
+
+        series_by_roll: Dict[float, Tuple[np.ndarray, np.ndarray]] = {}
+        roll_values: List[float] = []
+        all_vals: List[float] = []
+        for roll_f in sorted(roll_yaw_map.keys()):
+            yaw_bins = roll_yaw_map[roll_f]
+            if not yaw_bins:
+                continue
+            yaws = np.asarray(sorted(yaw_bins.keys()), dtype=float)
+            ys = np.asarray([float(np.mean(yaw_bins[yy])) for yy in yaws], dtype=float)
+            if ys.size == 0:
+                continue
+            series_by_roll[roll_f] = (yaws, ys)
+            roll_values.append(roll_f)
+            all_vals.extend(ys.tolist())
+
+        return {
+            "signature": sig,
+            "roll_values": roll_values,
+            "series_by_roll": series_by_roll,
+            "rows_count": len(rows),
+            "segment_count": len(set(str(x) for x in used)),
+            "peak": float(max(all_vals)) if all_vals else None,
+        }
+
+    def _ensure_report_pattern_cache(
+        self,
+        rows: List[object],
+        used: List[str],
+    ) -> Dict[str, object]:
+        """Return cached preprocessed pattern traces; rebuild when inputs changed."""
+        sig = self._report_pattern_cache_signature(rows, used)
+        cache = self._report_pattern_cache
+        if cache and cache.get("signature") == sig:
+            return cache
+        cache = self._build_report_pattern_cache(rows, used)
+        self._report_pattern_cache = cache
+        return cache
+
+    def _draw_report_pattern_from_cache(self, ax, cache: Dict[str, object]) -> str:
+        """Draw pattern plot from precomputed cache and selected slider index."""
+        roll_values = [float(x) for x in list(cache.get("roll_values", []) or [])]
+        series_by_roll = cache.get("series_by_roll", {})
+        if not roll_values or not isinstance(series_by_roll, dict):
+            ax.set_axis_off()
+            msg = "No usable rows for pattern preview."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            return msg
+
+        roll_values, planes, selected_idx = choose_pattern_display_planes(
+            roll_values,
+            int(self.report_pattern_plane_idx_var.get()),
+        )
+        self._sync_report_pattern_plane_controls(roll_values, selected_idx)
+        selected_plane = roll_values[selected_idx] if roll_values else None
+
+        plotted_vals: List[float] = []
+        for plane in planes:
+            pair = series_by_roll.get(plane)
+            if pair is None:
+                continue
+            yaws, ys = pair
+            yaws_arr = np.asarray(yaws, dtype=float)
+            ys_arr = np.asarray(ys, dtype=float)
+            if yaws_arr.size == 0 or ys_arr.size == 0:
+                continue
+            ax.plot(
+                yaws_arr,
+                ys_arr,
+                marker="o",
+                markersize=2.5,
+                linewidth=1.1,
+                label=f"Roll {plane:.1f}°",
+            )
+            plotted_vals.extend(ys_arr.tolist())
+
+        if not plotted_vals:
+            ax.set_axis_off()
+            msg = "No usable rows for pattern preview."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            return msg
+
+        ax.set_xlabel("Yaw (deg)")
+        ax.set_ylabel("Irradiance at 1m (uW/cm^2)")
+        ax.grid(True, alpha=0.3)
+        if len(planes) > 1:
+            ax.legend(loc="best", fontsize=8)
+        peak = float(max(plotted_vals))
+        rows_count = int(cache.get("rows_count", 0) or 0)
+        seg_count = int(cache.get("segment_count", 0) or 0)
+        if selected_plane is not None:
+            return (
+                f"Used {rows_count} web rows from {seg_count} selected segment(s). "
+                f"Peak {peak:.1f} uW/cm^2 @1m. "
+                f"Custom plane: roll {selected_plane:.1f} deg."
+            )
+        return f"Used {rows_count} web rows from {seg_count} selected segment(s). Peak {peak:.1f} uW/cm^2 @1m."
+
+    def _sync_report_pattern_plane_controls(
+        self,
+        roll_values: List[float],
+        selected_index: Optional[int] = None,
+    ):
+        """Sync pattern custom-plane slider limits and selected-value label."""
+        wanted_idx = (
+            int(selected_index)
+            if selected_index is not None
+            else int(self.report_pattern_plane_idx_var.get())
+        )
+        normalized, _planes, idx = choose_pattern_display_planes(roll_values, wanted_idx)
+
+        self._report_pattern_slider_syncing = True
+        try:
+            if not normalized:
+                self.report_pattern_plane_idx_var.set(0)
+                self.report_pattern_plane_label_var.set("No plane rows available.")
+                if self._report_pattern_slider is not None:
+                    self._report_pattern_slider.configure(from_=0, to=0, state=tk.DISABLED)
+                return
+            self.report_pattern_plane_idx_var.set(idx)
+            self.report_pattern_plane_label_var.set(f"Roll {normalized[idx]:.1f} deg")
+            if self._report_pattern_slider is not None:
+                state = tk.NORMAL if len(normalized) > 1 else tk.DISABLED
+                self._report_pattern_slider.configure(
+                    from_=0,
+                    to=max(0, len(normalized) - 1),
+                    state=state,
+                )
+        finally:
+            self._report_pattern_slider_syncing = False
+
+    def on_report_pattern_plane_slider_changed(self, raw_value: str):
+        """Update pattern preview when custom roll-plane slider changes."""
+        if self._report_pattern_slider_syncing:
+            return
+        cache = self._report_pattern_cache
+        roll_values = list(cache.get("roll_values", []) or [])
+        if not roll_values:
+            return
+        try:
+            requested_idx = int(round(float(raw_value)))
+        except Exception:
+            requested_idx = int(self.report_pattern_plane_idx_var.get())
+        normalized, _planes, idx = choose_pattern_display_planes(
+            [float(x) for x in roll_values],
+            requested_idx,
+        )
+        if not normalized:
+            return
+        self._sync_report_pattern_plane_controls(normalized, idx)
+        slot = self._report_preview_slot("pattern")
+        if slot:
+            fig: Figure = slot["figure"]  # type: ignore[assignment]
+            fig.clear()
+            ax = fig.add_subplot(111)
+            msg = self._draw_report_pattern_from_cache(ax, cache)
+            self._preview_set_message("pattern", msg)
+            self._preview_draw("pattern")
+
+    def _report_preview_slot(self, key: str) -> Optional[Dict[str, object]]:
+        """Return preview slot dict for a tab key."""
+        return self._report_preview_plots.get(key)
+
+    def _segment_id_parts(self, segment_id: str) -> Tuple[Optional[str], Optional[int]]:
+        """Parse segment id format `<scan_id>:<phase_idx>`."""
+        if ":" not in segment_id:
+            return None, None
+        sid, idx_txt = segment_id.split(":", 1)
+        try:
+            return sid, int(idx_txt)
+        except Exception:
+            return sid, None
+
+    def _valid_sorted_rows(self, rows: List[object]) -> List[object]:
+        """Filter invalid rows and sort by timestamp."""
+        out: List[object] = []
+        for row in rows:
+            ts = getattr(row, "timestamp", None)
+            if ts is None:
+                continue
+            if hasattr(row, "valid") and not bool(getattr(row, "valid")):
+                continue
+            out.append(row)
+        out.sort(key=lambda r: float(getattr(r, "timestamp", 0.0)))
+        return out
+
+    def _get_report_sweep(self, scan_id: str):
+        """Get cached sweep for report scan id; load if needed."""
+        if scan_id in self._report_sweep_cache:
+            return self._report_sweep_cache[scan_id]
+        rec = self.report_scans.get(scan_id)
+        if rec is None:
+            return None
+        sweep = self._load_sweep_from_path(rec.path, warn=False, trace=False)
+        if sweep is not None:
+            self._report_sweep_cache[scan_id] = sweep
+        return sweep
+
+    def _phase_rows_from_summary(self, sweep, phase_summary: Dict[str, object]) -> List[object]:
+        """Fallback rows for a phase summary when `phase.members` is unavailable."""
+        start = phase_summary.get("start_ts")
+        end = phase_summary.get("end_ts")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            return []
+        rows = []
+        for row in getattr(sweep, "rows", []) or []:
+            ts = getattr(row, "timestamp", None)
+            if ts is None:
+                continue
+            if float(start) <= float(ts) <= float(end):
+                rows.append(row)
+        return self._valid_sorted_rows(rows)
+
+    def _resolve_report_segment(self, seg_key: str) -> Optional[Dict[str, object]]:
+        """Resolve selected segment key to rows and owning scan info."""
+        segment_id = self.report_segment_selection.get(seg_key)
+        if not segment_id:
+            return None
+        scan_id, phase_idx = self._segment_id_parts(segment_id)
+        if not scan_id or phase_idx is None:
+            return None
+        rec = self.report_scans.get(scan_id)
+        sweep = self._get_report_sweep(scan_id)
+        if rec is None or sweep is None:
+            return None
+
+        phase_summary = rec.phases[phase_idx] if 0 <= phase_idx < len(rec.phases) else {}
+        rows: List[object] = []
+        scan_phases = getattr(sweep, "phases", []) or []
+        if 0 <= phase_idx < len(scan_phases):
+            rows = self._valid_sorted_rows(list(getattr(scan_phases[phase_idx], "members", []) or []))
+        if not rows and phase_summary:
+            rows = self._phase_rows_from_summary(sweep, phase_summary)
+        return {
+            "segment_id": segment_id,
+            "scan_id": scan_id,
+            "phase_idx": phase_idx,
+            "scan_record": rec,
+            "phase_summary": phase_summary,
+            "sweep": sweep,
+            "rows": rows,
+        }
+
+    def _collect_rows_from_segment_keys(self, seg_keys: List[str]) -> Tuple[List[object], List[str]]:
+        """Collect rows from selected segment keys."""
+        rows: List[object] = []
+        used: List[str] = []
+        for key in seg_keys:
+            seg = self._resolve_report_segment(key)
+            if not seg or not seg["rows"]:
+                continue
+            rows.extend(seg["rows"])
+            used.append(str(seg["segment_id"]))
+        return self._valid_sorted_rows(rows), used
+
+    def _select_burnin_rows(self) -> Tuple[List[object], Optional[str]]:
+        """Pick long-run warm-up rows for burn-in preview."""
+        best_rows: List[object] = []
+        best_sid: Optional[str] = None
+        best_score = (-1.0, -1.0)
+        for sid, rec in self.report_scans.items():
+            if rec.role not in ("Burn-in Scan", "Complete Dataset", "Main Scan"):
+                continue
+            sweep = self._get_report_sweep(sid)
+            if sweep is None:
+                continue
+            rows: List[object] = []
+            phases = getattr(sweep, "phases", []) or []
+            for ph in rec.phases:
+                idx = int(ph.get("index", 0))
+                tag = self._phase_tag_for_record(rec, idx, ph)
+                if tag != "Warm-up":
+                    continue
+                if 0 <= idx < len(phases):
+                    rows.extend(list(getattr(phases[idx], "members", []) or []))
+            rows = self._valid_sorted_rows(rows)
+            if len(rows) < 2:
+                continue
+            duration_h = (float(rows[-1].timestamp) - float(rows[0].timestamp)) / 3600.0
+            first_seen = float(rec.meta.get("first_ts")) if isinstance(rec.meta.get("first_ts"), (int, float)) else -1.0
+            score = (duration_h, first_seen)
+            if score > best_score:
+                best_score = score
+                best_rows = rows
+                best_sid = sid
+        return best_rows, best_sid
+
+    def _nearest_value(self, values: List[float], target: float) -> Optional[float]:
+        """Return nearest value to target from a non-empty float list."""
+        if not values:
+            return None
+        return min(values, key=lambda v: abs(v - target))
+
+    def _load_weight_tables_from_py_data(self) -> bool:
+        """Load vendored full-fidelity IES/IEC weighting tables from this repository."""
+        if self._report_weight_tables:
+            return True
+        import importlib.util
+
+        def _import_module(path: str, module_name: str):
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                return None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+        py_data_dir = os.path.join(os.path.dirname(__file__), "reporting_data")
+        ies_py = os.path.join(py_data_dir, "iestable.py")
+        iec_py = os.path.join(py_data_dir, "iectable.py")
+        if not (os.path.isfile(ies_py) and os.path.isfile(iec_py)):
+            return False
+        try:
+            ies_mod = _import_module(ies_py, "_sweep_iestable")
+            iec_mod = _import_module(iec_py, "_sweep_iectable")
+            if ies_mod is None or iec_mod is None:
+                return False
+            raw_iestable = list(getattr(ies_mod, "iestab", []) or [])
+            eye_rows: List[Tuple[float, float]] = []
+            skin_rows: List[Tuple[float, float]] = []
+            for row in raw_iestable:
+                if not isinstance(row, (tuple, list)) or len(row) < 3:
+                    continue
+                try:
+                    wvl = float(row[0])
+                    eye = float(row[1])
+                    skin = float(row[2])
+                except Exception:
+                    continue
+                if not (np.isfinite(wvl) and np.isfinite(eye) and np.isfinite(skin)):
+                    continue
+                if eye <= 0 or skin <= 0:
+                    continue
+                eye_rows.append((wvl, eye))
+                skin_rows.append((wvl, skin))
+            if len(eye_rows) < 8 or len(skin_rows) < 8:
+                return False
+            eye_rows.sort(key=lambda p: p[0])
+            skin_rows.sort(key=lambda p: p[0])
+            eye_x = np.asarray([p[0] for p in eye_rows], dtype=float)
+            eye_y = np.asarray([p[1] for p in eye_rows], dtype=float)
+            skin_x = np.asarray([p[0] for p in skin_rows], dtype=float)
+            skin_y = np.asarray([p[1] for p in skin_rows], dtype=float)
+
+            iec_data = getattr(iec_mod, "iec_slambda", None)
+            iec_x = np.asarray([], dtype=float)
+            iec_y = np.asarray([], dtype=float)
+            if isinstance(iec_data, (tuple, list)) and len(iec_data) >= 2:
+                iec_x = np.asarray(iec_data[0], dtype=float)
+                iec_y = np.asarray(iec_data[1], dtype=float)
+            if iec_x.size == 0 or iec_y.size == 0:
+                raw_iec = list(getattr(iec_mod, "d", []) or [])
+                iec_rows: List[Tuple[float, float]] = []
+                for row in raw_iec:
+                    if not isinstance(row, (tuple, list)) or len(row) < 2:
+                        continue
+                    try:
+                        wvl = float(row[0])
+                        val = float(row[1])
+                    except Exception:
+                        continue
+                    if np.isfinite(wvl) and np.isfinite(val) and val > 0:
+                        iec_rows.append((wvl, val))
+                iec_rows.sort(key=lambda p: p[0])
+                iec_x = np.asarray([p[0] for p in iec_rows], dtype=float)
+                iec_y = np.asarray([p[1] for p in iec_rows], dtype=float)
+            if iec_x.size < 8 or iec_y.size < 8:
+                return False
+            order = np.argsort(iec_x)
+            iec_x = iec_x[order]
+            iec_y = iec_y[order]
+            keep = np.isfinite(iec_x) & np.isfinite(iec_y) & (iec_y > 0)
+            iec_x = iec_x[keep]
+            iec_y = iec_y[keep]
+            if iec_x.size < 8:
+                return False
+
+            self._report_weight_tables = {
+                "IES/ANSI Eye": (eye_x, eye_y),
+                "IES/ANSI Skin": (skin_x, skin_y),
+                "IEC": (iec_x, iec_y),
+            }
+            self._report_weight_table_source = py_data_dir
+            return True
+        except Exception:
+            return False
+
+    def _weighting_curve_source(self, mode: str) -> str:
+        """Describe which weighting curve source is active for a mode."""
+        if mode in self._report_weight_tables:
+            src = self._report_weight_table_source or "reporting_data"
+            return f"vendored tables ({src})"
+        return "embedded fallback anchors"
+
+    def _lookup_slambda_value(self, mode: str, wavelength_nm: float) -> float:
+        """Lookup S(lambda) for selected standard mode."""
+        wvl = float(wavelength_nm)
+        if mode == "Unweighted":
+            return 1.0 if 200.0 <= wvl <= 400.0 else 0.0
+
+        # Preferred source: vendored full-fidelity py_data tables.
+        self._load_weight_tables_from_py_data()
+        table = self._report_weight_tables.get(mode)
+        if table is not None:
+            xs, ys = table
+            return float(max(0.0, log_interp_clamped(wvl, xs, ys, zero_at_or_above=400.0)))
+
+        curve = REPORT_EXPOSURE_WEIGHT_CURVES.get(mode)
+        if not curve:
+            return 1.0
+        xs = np.asarray(curve["nm"], dtype=float)
+        ys = np.asarray(curve["val"], dtype=float)
+        if xs.size == 0:
+            return 1.0
+        return float(max(0.0, log_interp_clamped(wvl, xs, ys, zero_at_or_above=400.0)))
+
+    def _selected_spectral_point_data(self) -> Optional[Dict[str, object]]:
+        """Resolve selected spectrum point into sweep, row, wavelengths, and spectrum arrays."""
+        seg = self._resolve_report_segment("spectrum_point")
+        if not seg or not seg["rows"]:
+            return None
+        sweep = seg["sweep"]
+        rows = sorted(
+            seg["rows"],
+            key=lambda r: (
+                float(getattr(getattr(r, "coords", None), "lin_mm", 0.0) or 0.0),
+                float(getattr(r, "timestamp", 0.0) or 0.0),
+            ),
+        )
+        spec_row = None
+        for row in rows:
+            spec = getattr(getattr(row, "capture", None), "spectral_result", None)
+            if spec is not None and len(spec):
+                spec_row = row
+                break
+        if spec_row is None:
+            return None
+        wavelengths = np.asarray(getattr(sweep, "spectral_wavelengths", []) or [], dtype=float)
+        values = np.asarray(getattr(spec_row.capture, "spectral_result", []) or [], dtype=float)
+        if values.size == 0:
+            return None
+        if wavelengths.size != values.size or wavelengths.size == 0:
+            wavelengths = np.arange(values.size, dtype=float)
+        return {"segment": seg, "sweep": sweep, "row": spec_row, "wavelengths": wavelengths, "values": values}
+
+    def _compute_exposure_weighting_factor(self, mode: str, wavelengths: np.ndarray, values: np.ndarray) -> float:
+        """Compute spectrum-averaged weighting factor for selected exposure mode."""
+        if mode == "Unweighted":
+            return 1.0
+        mask = (wavelengths >= 200.0) & (wavelengths <= 400.0)
+        xs = wavelengths[mask]
+        ys = values[mask]
+        if xs.size < 2:
+            return 1.0
+        if hasattr(np, "trapezoid"):
+            denom = float(np.trapezoid(ys, xs))
+        else:
+            denom = float(np.trapz(ys, xs))
+        if not np.isfinite(denom) or denom <= 0:
+            return 1.0
+        weights = np.asarray([self._lookup_slambda_value(mode, float(x)) for x in xs], dtype=float)
+        if hasattr(np, "trapezoid"):
+            numer = float(np.trapezoid(ys * weights, xs))
+        else:
+            numer = float(np.trapz(ys * weights, xs))
+        if not np.isfinite(numer) or numer <= 0:
+            return 1.0
+        return numer / denom
+
+    def _current_optical_power_band(self) -> Tuple[Optional[Tuple[float, float]], str, Optional[str]]:
+        """Return selected optical power band setting and display label."""
+        mode = self.report_optical_power_mode_var.get().strip() or "Band"
+        if mode == "Full spectrum":
+            return None, "full spectrum", None
+        lo_txt = self.report_optical_power_min_nm_var.get().strip()
+        hi_txt = self.report_optical_power_max_nm_var.get().strip()
+        try:
+            lo = float(lo_txt)
+            hi = float(hi_txt)
+        except Exception:
+            return None, "band", "Optical power band must be numeric."
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            return None, "band", "Optical power band must be finite numbers."
+        if hi <= lo:
+            return None, "band", "Optical power range requires max > min."
+        return (float(lo), float(hi)), f"{lo:g}-{hi:g} nm", None
+
+    def _integrate_array_band(self, x_nm: np.ndarray, y_vals: np.ndarray, band: Optional[Tuple[float, float]]) -> float:
+        """Integrate spectral array over a wavelength band or full available range."""
+        xs = np.asarray(x_nm, dtype=float)
+        ys = np.asarray(y_vals, dtype=float)
+        if xs.size == 0 or ys.size == 0:
+            return 0.0
+        if xs.size != ys.size:
+            n = min(xs.size, ys.size)
+            xs = xs[:n]
+            ys = ys[:n]
+        if band is not None:
+            lo, hi = band
+            mask = (xs >= float(lo)) & (xs <= float(hi))
+            xs = xs[mask]
+            ys = ys[mask]
+        if xs.size < 2:
+            return float(np.sum(ys))
+        if hasattr(np, "trapezoid"):
+            return float(np.trapezoid(ys, xs))
+        return float(np.trapz(ys, xs))
+
+    def _row_band_irradiance_wm2(
+        self,
+        row,
+        sweep,
+        band: Optional[Tuple[float, float]],
+        require_spectral: bool = False,
+    ) -> Optional[float]:
+        """Return row irradiance in W/m^2 for requested band; None when unavailable."""
+        def _to_reference_1m(value_wm2: float) -> float:
+            coords = getattr(row, "coords", None)
+            lin_mm = getattr(coords, "lin_mm", None) if coords is not None else None
+            if isinstance(lin_mm, (int, float)) and float(lin_mm) > 0:
+                return float(value_wm2) * ((float(lin_mm) / 1000.0) ** 2)
+            return float(value_wm2)
+
+        capture = getattr(row, "capture", None)
+        spectral = getattr(capture, "spectral_result", None) if capture is not None else None
+        has_spectral = spectral is not None and len(spectral) > 0
+        wavelengths = np.asarray(getattr(sweep, "spectral_wavelengths", []) or [], dtype=float)
+        values = np.asarray(spectral or [], dtype=float)
+
+        if band is None:
+            if has_spectral:
+                if wavelengths.size == values.size and values.size > 0:
+                    return _to_reference_1m(self._integrate_array_band(wavelengths, values, None))
+            return _to_reference_1m(float(getattr(capture, "integral_result", 0.0) or 0.0))
+
+        lo, hi = band
+        if has_spectral:
+            if wavelengths.size == values.size and values.size > 0:
+                return _to_reference_1m(self._integrate_array_band(wavelengths, values, (float(lo), float(hi))))
+        if require_spectral:
+            return None
+        return _to_reference_1m(float(getattr(capture, "integral_result", 0.0) or 0.0))
+
+    def _integrate_total_power_from_web_rows(
+        self,
+        sweep,
+        rows: List[object],
+        band: Optional[Tuple[float, float]],
+        require_spectral: bool = False,
+    ) -> Optional[float]:
+        """Integrate total optical power from web rows over hemisphere (returns watts)."""
+        valid_rows = self._valid_sorted_rows(rows)
+        if not valid_rows:
+            return None
+        yaw_vals = sorted(
+            {
+                round(abs(float(getattr(getattr(r, "coords", None), "yaw_deg", 0.0) or 0.0)), 6)
+                for r in valid_rows
+                if getattr(getattr(r, "coords", None), "yaw_deg", None) is not None
+            }
+        )
+        if len(yaw_vals) < 2:
+            return None
+        ystep = float(np.median(np.diff(np.asarray(yaw_vals, dtype=float))))
+        if not np.isfinite(ystep) or ystep <= 0:
+            return None
+        tol = max(1e-4, ystep * 0.25)
+        total_w = 0.0
+        used_bands = 0
+        for y in yaw_vals:
+            if y <= 0:
+                theta_lo = 0.0
+                theta_hi = min(90.0, ystep / 2.0)
+            else:
+                theta_lo = max(0.0, y - (ystep / 2.0))
+                theta_hi = min(90.0, y + (ystep / 2.0))
+            if theta_hi <= theta_lo:
+                continue
+            area_sr = 2.0 * math.pi * (
+                math.cos(math.radians(theta_lo)) - math.cos(math.radians(theta_hi))
+            )
+            band_vals: List[float] = []
+            for row in valid_rows:
+                coords = getattr(row, "coords", None)
+                if coords is None or getattr(coords, "yaw_deg", None) is None:
+                    continue
+                y_abs = abs(float(coords.yaw_deg))
+                if abs(y_abs - y) > tol:
+                    continue
+                v = self._row_band_irradiance_wm2(row, sweep, band, require_spectral=require_spectral)
+                if v is None or not np.isfinite(v) or v < 0:
+                    continue
+                band_vals.append(float(v))
+            if not band_vals:
+                continue
+            used_bands += 1
+            total_w += area_sr * float(np.mean(band_vals))
+        if used_bands == 0:
+            return None
+        return float(total_w)
+
+    def _compute_spectrum_fraction_for_band(
+        self,
+        wavelengths: np.ndarray,
+        values: np.ndarray,
+        band: Tuple[float, float],
+    ) -> Optional[float]:
+        """Return fraction of full-spectrum power inside requested band."""
+        denom = self._integrate_array_band(wavelengths, values, None)
+        if not np.isfinite(denom) or denom <= 0:
+            return None
+        numer = self._integrate_array_band(wavelengths, values, band)
+        if not np.isfinite(numer) or numer < 0:
+            return None
+        return float(numer / denom)
+
+    def _estimate_total_optical_power_mw(self) -> Tuple[Optional[float], str]:
+        """Estimate total optical power (mW) using selected web and wavelength controls."""
+        band, band_label, err = self._current_optical_power_band()
+        if err:
+            return None, err
+        return self._estimate_optical_power_mw_for_band(band, band_label)
+
+    def _estimate_optical_power_mw_for_band(
+        self,
+        band: Optional[Tuple[float, float]],
+        band_label: Optional[str] = None,
+    ) -> Tuple[Optional[float], str]:
+        """Estimate optical power (mW) for a specific band or full spectrum."""
+        if band_label is None:
+            if band is None:
+                band_label = "full spectrum"
+            else:
+                band_label = f"{float(band[0]):g}-{float(band[1]):g} nm"
+        seg = self._resolve_report_segment("tight_web")
+        if not seg or not seg["rows"]:
+            seg = self._resolve_report_segment("loose_web")
+        if not seg or not seg["rows"]:
+            return None, "No web segment selected for optical power integration."
+
+        sweep = seg["sweep"]
+        rows = list(seg["rows"])
+        total_full_w = self._integrate_total_power_from_web_rows(sweep, rows, band=None, require_spectral=False)
+        if total_full_w is None:
+            return None, "Could not integrate full-spectrum optical power from selected web rows."
+
+        if band is None:
+            return total_full_w * 1000.0, f"{band_label} from segment {seg['segment_id']} (hemisphere web integration)."
+
+        # Preferred path: direct spectral integration across web rows.
+        direct_band_w = self._integrate_total_power_from_web_rows(
+            sweep,
+            rows,
+            band=band,
+            require_spectral=True,
+        )
+        if direct_band_w is not None:
+            return direct_band_w * 1000.0, f"{band_label} from segment {seg['segment_id']} (direct spectral web integration)."
+
+        # Fallback path used by legacy workflow when web rows are integral-only.
+        spectral = self._selected_spectral_point_data()
+        if not spectral:
+            return None, f"{band_label} requires spectrum-point data when web rows are integral-only."
+        frac = self._compute_spectrum_fraction_for_band(
+            np.asarray(spectral["wavelengths"], dtype=float),
+            np.asarray(spectral["values"], dtype=float),
+            band,
+        )
+        if frac is None:
+            return None, f"Could not derive spectral fraction for {band_label}."
+        estimate_w = total_full_w * frac
+        return (
+            estimate_w * 1000.0,
+            f"{band_label} estimated from segment {seg['segment_id']} using spectrum-point fraction "
+            f"({frac * 100.0:.1f}% of full-spectrum web power).",
+        )
+
+    def _integrate_spectrum_band(self, sweep, wavelengths: np.ndarray, values: np.ndarray, lo: float, hi: float) -> float:
+        """Integrate spectrum over wavelength band using sweep helper when available."""
+        try:
+            return float(sweep.integrate_spectral(list(values), float(lo), float(hi)))
+        except Exception:
+            mask = (wavelengths >= float(lo)) & (wavelengths <= float(hi))
+            if not np.any(mask):
+                return 0.0
+            xs = wavelengths[mask]
+            ys = values[mask]
+            if xs.size < 2:
+                return float(np.sum(ys))
+            return float(np.trapz(ys, xs))
+
+    def _preview_set_message(self, key: str, message: str):
+        """Set status message line for one preview tab."""
+        slot = self._report_preview_slot(key)
+        if not slot:
+            return
+        msg_var = slot.get("message_var")
+        if isinstance(msg_var, tk.StringVar):
+            msg_var.set(message)
+
+    def _preview_draw(self, key: str):
+        """Redraw one preview figure."""
+        slot = self._report_preview_slot(key)
+        if not slot:
+            return
+        canvas = slot.get("canvas")
+        if canvas is not None:
+            canvas.draw_idle()
+
+    def _open_report_figure_popout(
+        self,
+        title: str,
+        render_cb: Callable[[Figure], None],
+        *,
+        geometry: str = "980x640",
+    ):
+        """Open a standalone Matplotlib popout window with toolbar controls."""
+        win = tk.Toplevel(self)
+        win.title(title)
+        try:
+            win.geometry(geometry)
+        except Exception:
+            pass
+        shell = ttk.Frame(win, padding=(6, 6))
+        shell.pack(fill=tk.BOTH, expand=True)
+        fig = Figure(figsize=(9.0, 5.6), dpi=100, tight_layout=True)
+        render_cb(fig)
+        canvas = FigureCanvasTkAgg(fig, master=shell)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar_shell = ttk.Frame(shell)
+        toolbar_shell.pack(fill=tk.X, expand=False, pady=(2, 0))
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_shell, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side=tk.LEFT)
+        ttk.Label(
+            toolbar_shell,
+            text="Use toolbar controls to pan, box-zoom, reset, and save.",
+            style="Hint.TLabel",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        canvas.draw_idle()
+
+    def _spectral_cache_ready(self) -> bool:
+        """Return True when latest spectral preview cache has plot/table data."""
+        return bool(self._report_spectral_cache.get("has_data"))
+
+    def on_report_open_spectral_table_popout(self):
+        """Open table-only spectral waveband view in a standalone window."""
+        if not self._spectral_cache_ready():
+            messagebox.showinfo("Spectral Table", "Refresh spectral preview first.")
+            return
+        table_rows = list(self._report_spectral_cache.get("table_rows", []) or [])
+        if not table_rows:
+            messagebox.showinfo("Spectral Table", "No spectral table rows available yet.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Spectral Power Bins")
+        try:
+            win.geometry("920x520")
+        except Exception:
+            pass
+        shell = ttk.Frame(win, padding=(6, 6))
+        shell.pack(fill=tk.BOTH, expand=True)
+        cols = ("waveband", "power_mw", "pct_total_uv")
+        tv = ttk.Treeview(shell, columns=cols, show="headings", selectmode="browse")
+        tv.heading("waveband", text="Waveband")
+        tv.heading("power_mw", text="Optical Power (mW)")
+        tv.heading("pct_total_uv", text="% of Total UV")
+        tv.column("waveband", width=450, anchor="w", stretch=True)
+        tv.column("power_mw", width=180, anchor="w", stretch=False)
+        tv.column("pct_total_uv", width=150, anchor="w", stretch=False)
+        ysb = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=tv.yview)
+        tv.configure(yscrollcommand=ysb.set)
+        tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        for row in table_rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            tv.insert("", tk.END, values=(str(row[0]), str(row[1]), str(row[2])))
+
+    def _render_cached_spectral_linear(self, fig: Figure):
+        """Render standalone linear spectrum from cache."""
+        ax = fig.add_subplot(111)
+        wavelengths = np.asarray(self._report_spectral_cache.get("wavelengths", []), dtype=float)
+        normalized = np.asarray(self._report_spectral_cache.get("normalized", []), dtype=float)
+        weighted_curves = self._report_spectral_cache.get("weighted_curves", {})
+        ax.plot(wavelengths, normalized, linewidth=1.4, label="Raw")
+        if isinstance(weighted_curves, dict):
+            for mode, arr in weighted_curves.items():
+                ax.plot(wavelengths, np.asarray(arr, dtype=float), linewidth=1.1, alpha=0.9, label=f"{mode} weighted")
+        ax.set_title("Source Spectrum (linear + weighted overlays)", fontsize=11)
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Relative intensity (%)")
+        if wavelengths.size:
+            ax.set_xlim(max(190.0, float(np.min(wavelengths))), min(410.0, float(np.max(wavelengths))))
+        y_top = float(self._report_spectral_cache.get("linear_ymax", 110.0) or 110.0)
+        ax.set_ylim(0.0, max(110.0, y_top))
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8, ncol=2)
+
+    def _render_cached_spectral_log(self, fig: Figure):
+        """Render standalone log-detail spectrum from cache."""
+        ax = fig.add_subplot(111)
+        wavelengths = np.asarray(self._report_spectral_cache.get("wavelengths", []), dtype=float)
+        mask_log = np.asarray(self._report_spectral_cache.get("mask_log", []), dtype=bool)
+        normalized = np.asarray(self._report_spectral_cache.get("normalized", []), dtype=float)
+        weighted_curves = self._report_spectral_cache.get("weighted_curves", {})
+        if wavelengths.size == 0 or mask_log.size != wavelengths.size:
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No cached log-spectrum data.", ha="center", va="center", transform=ax.transAxes)
+            return
+        x_log = wavelengths[mask_log]
+        if x_log.size == 0:
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No cached log-spectrum data.", ha="center", va="center", transform=ax.transAxes)
+            return
+        ax.plot(x_log, np.clip(normalized[mask_log], 1e-4, None), linewidth=1.4, label="Raw")
+        if isinstance(weighted_curves, dict):
+            for mode, arr in weighted_curves.items():
+                aa = np.asarray(arr, dtype=float)
+                if aa.size != wavelengths.size:
+                    continue
+                ax.plot(x_log, np.clip(aa[mask_log], 1e-4, None), linewidth=1.1, alpha=0.9, label=f"{mode} weighted")
+        ax.set_title("Source Spectrum (log detail + weighted overlays)", fontsize=11)
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Relative intensity (%)")
+        ax.set_yscale("log")
+        ax.set_xlim(float(np.min(x_log)), float(np.max(x_log)))
+        y_min = float(self._report_spectral_cache.get("log_ymin", 1e-4) or 1e-4)
+        y_max = float(self._report_spectral_cache.get("log_ymax", 1.0) or 1.0)
+        ax.set_ylim(max(1e-4, y_min), max(1.0, y_max))
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8, ncol=2)
+
+    def on_report_open_spectral_linear_popout(self):
+        """Open standalone linear spectrum view with full toolbar interaction."""
+        if not self._spectral_cache_ready():
+            messagebox.showinfo("Spectral Plot", "Refresh spectral preview first.")
+            return
+        self._open_report_figure_popout(
+            "Spectral Plot: Linear",
+            self._render_cached_spectral_linear,
+        )
+
+    def on_report_open_spectral_log_popout(self):
+        """Open standalone log-detail spectrum view with full toolbar interaction."""
+        if not self._spectral_cache_ready():
+            messagebox.showinfo("Spectral Plot", "Refresh spectral preview first.")
+            return
+        self._open_report_figure_popout(
+            "Spectral Plot: Log Detail",
+            self._render_cached_spectral_log,
+        )
+
+    def _read_report_csv_frame(self, path: str) -> pd.DataFrame:
+        """Load report CSV with fallback for headerless files."""
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            df = pd.read_csv(path, header=None)
+        if len(df.columns) >= 3 and all(str(c).replace(".", "", 1).isdigit() for c in df.columns):
+            # Likely headerless; reload as numeric columns.
+            df = pd.read_csv(path, header=None)
+            df.columns = [f"col_{i}" for i in range(len(df.columns))]
+        return df
+
+    def _find_csv_column(self, columns: List[object], tokens: List[str]) -> Optional[object]:
+        """Find first column containing any token."""
+        normalized_tokens = [str(tok).strip().lower() for tok in tokens if str(tok).strip()]
+        names = [(col, str(col).strip().lower()) for col in columns]
+        for tok in normalized_tokens:
+            for col, name in names:
+                if name == tok:
+                    return col
+        for tok in normalized_tokens:
+            for col, name in names:
+                if name.startswith(tok + "_") or name.endswith("_" + tok) or f"_{tok}_" in name:
+                    return col
+        for tok in normalized_tokens:
+            if len(tok) < 3:
+                continue
+            for col, name in names:
+                if tok in name:
+                    return col
+        return None
+
+    def _series_numeric(self, df: pd.DataFrame, col: Optional[object]) -> Optional[pd.Series]:
+        """Return numeric series for a column or None."""
+        if col is None or col not in df.columns:
+            return None
+        s = pd.to_numeric(df[col], errors="coerce")
+        s = s.dropna()
+        if s.empty:
+            return None
+        return s
+
+    def on_report_refresh_previews(self):
+        """Recompute all report analysis previews from selected segments and CSVs."""
+        summaries: Dict[str, str] = {}
+        try:
+            summaries["pattern"] = self._refresh_report_pattern_preview()
+            summaries["warmup"] = self._refresh_report_warmup_preview()
+            summaries["burnin"] = self._refresh_report_burnin_preview()
+            summaries["spectral"] = self._refresh_report_spectral_preview()
+            summaries["exposure"] = self._refresh_report_exposure_preview()
+            summaries["roll"] = self._refresh_report_roll_preview()
+            summaries["r2"] = self._refresh_report_r2_preview()
+            summaries["electrical"] = self._refresh_report_electrical_preview()
+            self._refresh_report_overview_preview(summaries)
+            self.report_preview_status_var.set(
+                f"Refreshed {time.strftime('%Y-%m-%d %H:%M:%S')} from selected report segments."
+            )
+            self._set_status("Report analysis previews refreshed.")
+        except Exception as e:
+            traceback.print_exc()
+            self.report_preview_status_var.set(f"Preview refresh failed: {e}")
+            self._set_status(f"Report preview refresh failed: {e}")
+
+    def _refresh_report_overview_preview(self, summaries: Dict[str, str]):
+        """Update overview text with metadata, selected segments, and computed summaries."""
+        meta = self._collect_report_metadata()
+        lines: List[str] = []
+        lines.append("Report Metadata")
+        lines.append(f"- Reporting Name: {meta.get('reporting_name', '') or '(unset)'}")
+        lines.append(f"- Catalog ID: {meta.get('catalog_id', '') or '(unset)'}")
+        lines.append(f"- Revision: {meta.get('revision_name', '') or '(unset)'} ({meta.get('revision_date', '') or 'date unset'})")
+        lines.append("")
+        lines.append("Selected Segments")
+        for key, label in REPORT_SEGMENT_TYPES:
+            seg = self.report_segment_selection.get(key)
+            lines.append(f"- {label}: {seg or '(not selected)'}")
+        lines.append("")
+        lines.append("Preview Summaries")
+        lines.append(f"- exposure_mode: {self.report_exposure_mode_var.get().strip() or 'Unweighted'}")
+        band, band_label, band_err = self._current_optical_power_band()
+        if band_err:
+            lines.append(f"- optical_power_band: invalid ({band_err})")
+        else:
+            lines.append(f"- optical_power_band: {band_label if band is not None else 'full spectrum'}")
+        for sec in ("pattern", "warmup", "burnin", "spectral", "exposure", "roll", "r2", "electrical"):
+            val = summaries.get(sec, "No summary available.")
+            lines.append(f"- {sec}: {val}")
+        lines.append("")
+        lines.append("Notes")
+        for key, label in REPORT_COMMENT_FIELDS:
+            txt = self._get_report_comment_text(key)
+            lines.append(f"- {label}: {txt if txt else '(none)'}")
+        self._set_readonly_text_widget(self._report_overview_text, "\n".join(lines))
+
+    def _refresh_report_pattern_preview(self) -> str:
+        """Render a pattern preview from selected web segments."""
+        slot = self._report_preview_slot("pattern")
+        if not slot:
+            return "Pattern tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        rows, used = self._collect_rows_from_segment_keys(["tight_web", "loose_web"])
+        if not rows:
+            self._report_pattern_cache = {}
+            self._sync_report_pattern_plane_controls([], 0)
+            ax.set_axis_off()
+            msg = "No loose/tight web rows selected."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("pattern", msg)
+            self._preview_draw("pattern")
+            return msg
+
+        cache = self._ensure_report_pattern_cache(rows, used)
+        msg = self._draw_report_pattern_from_cache(ax, cache)
+        self._preview_set_message("pattern", msg)
+        self._preview_draw("pattern")
+        return msg
+
+    def _refresh_report_warmup_preview(self) -> str:
+        """Render warm-up preview from selected warm-up segment."""
+        slot = self._report_preview_slot("warmup")
+        if not slot:
+            return "Warm-up tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        seg = self._resolve_report_segment("warmup")
+        if not seg or not seg["rows"]:
+            ax.set_axis_off()
+            msg = "No warm-up segment selected."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("warmup", msg)
+            self._preview_draw("warmup")
+            return msg
+
+        rows = seg["rows"]
+        t0 = float(rows[0].timestamp)
+        xs = [(float(r.timestamp) - t0) / 60.0 for r in rows]
+        ys = [self._row_intensity_uW_cm2(r, normalize_to_1m=True) for r in rows]
+        ax.plot(xs, ys, linewidth=1.1)
+        ax.set_xlabel("Elapsed time (min)")
+        ax.set_ylabel("Irradiance at 1m (uW/cm^2)")
+        ax.grid(True, alpha=0.3)
+
+        drift_msg = "Drift unavailable"
+        if len(rows) > 2:
+            t_last = float(rows[-1].timestamp)
+            recent = [(float(r.timestamp), self._row_intensity_uW_cm2(r, True)) for r in rows]
+            older = [p for p in recent if (t_last - p[0]) >= (10 * 60)]
+            if older:
+                base = older[-1][1]
+                last = recent[-1][1]
+                if abs(last) > 1e-9:
+                    drift_pct = abs(last - base) / abs(last) * 100.0
+                    drift_msg = f"10-min drift {drift_pct:.2f}%"
+        duration_h = (float(rows[-1].timestamp) - float(rows[0].timestamp)) / 3600.0 if len(rows) >= 2 else 0.0
+        msg = f"Warm-up duration {duration_h:.2f}h from segment {seg['segment_id']}. {drift_msg}."
+        self._preview_set_message("warmup", msg)
+        self._preview_draw("warmup")
+        return msg
+
+    def _refresh_report_burnin_preview(self) -> str:
+        """Render long-duration warm-up/burn-in preview from complete dataset scans."""
+        slot = self._report_preview_slot("burnin")
+        if not slot:
+            return "Burn-in tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        rows, sid = self._select_burnin_rows()
+        if len(rows) < 2:
+            ax.set_axis_off()
+            msg = "No complete burn-in warm-up run found (need a long warm-up sequence)."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("burnin", msg)
+            self._preview_draw("burnin")
+            return msg
+
+        t0 = float(rows[0].timestamp)
+        xs = [(float(r.timestamp) - t0) / 3600.0 for r in rows]
+        ys = [self._row_intensity_uW_cm2(r, normalize_to_1m=True) for r in rows]
+        ax.plot(xs, ys, linewidth=1.1)
+        ax.set_xlabel("Elapsed time (h)")
+        ax.set_ylabel("Irradiance at 1m (uW/cm^2)")
+        ax.grid(True, alpha=0.3)
+
+        final = ys[-1] if ys else 0.0
+        if final > 0:
+            for pct in (20, 40, 60, 80, 100):
+                ax.axhline(final * (pct / 100.0), linestyle="--", linewidth=0.8, color="gray", alpha=0.4)
+        duration_h = xs[-1] if xs else 0.0
+        msg = f"Burn-in preview from scan {sid}: {duration_h:.1f}h warm-up trajectory."
+        self._preview_set_message("burnin", msg)
+        self._preview_draw("burnin")
+        return msg
+
+    def _refresh_report_spectral_preview(self) -> str:
+        """Render spectral plots with weighted overlays and wavelength-bin power table."""
+        slot = self._report_preview_slot("spectral")
+        if not slot:
+            return "Spectral tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        fig.set_tight_layout(False)
+        gspec = fig.add_gridspec(3, 1, height_ratios=[1.75, 1.95, 1.95], hspace=0.58)
+        fig.subplots_adjust(top=0.98, bottom=0.08)
+        ax_table = fig.add_subplot(gspec[0])
+        ax_linear = fig.add_subplot(gspec[1])
+        ax_log = fig.add_subplot(gspec[2])
+        ax_table.set_navigate(False)
+
+        spectral = self._selected_spectral_point_data()
+        if not spectral:
+            self._report_spectral_cache = {"has_data": False}
+            ax_table.set_axis_off()
+            ax_linear.set_axis_off()
+            ax_log.set_axis_off()
+            msg = "No spectrum-point segment selected."
+            ax_linear.text(0.5, 0.5, msg, ha="center", va="center", transform=ax_linear.transAxes)
+            self._preview_set_message("spectral", msg)
+            self._preview_draw("spectral")
+            return msg
+
+        sweep = spectral["sweep"]
+        wavelengths = np.asarray(spectral["wavelengths"], dtype=float)
+        values = np.asarray(spectral["values"], dtype=float)
+        vmax = float(np.max(values)) if values.size else 0.0
+        if vmax <= 0:
+            self._report_spectral_cache = {"has_data": False}
+            ax_table.set_axis_off()
+            ax_linear.set_axis_off()
+            ax_log.set_axis_off()
+            msg = "Spectrum values are empty or zero."
+            ax_linear.text(0.5, 0.5, msg, ha="center", va="center", transform=ax_linear.transAxes)
+            self._preview_set_message("spectral", msg)
+            self._preview_draw("spectral")
+            return msg
+
+        normalized = (values / vmax) * 100.0
+        weighted_curves: Dict[str, np.ndarray] = {}
+        weighting_sources: List[str] = []
+        for mode in ("IES/ANSI Eye", "IES/ANSI Skin", "IEC"):
+            weights = np.asarray([self._lookup_slambda_value(mode, float(w)) for w in wavelengths], dtype=float)
+            ref_222 = max(self._lookup_slambda_value(mode, 222.0), 1e-12)
+            weighted_curves[mode] = normalized * (weights / ref_222)
+            weighting_sources.append(f"{mode}: {self._weighting_curve_source(mode)}")
+
+        all_curve_arrays = [normalized] + list(weighted_curves.values())
+        all_max = max(float(np.nanmax(np.asarray(c, dtype=float))) for c in all_curve_arrays)
+
+        ax_linear.plot(wavelengths, normalized, linewidth=1.25, label="Raw")
+        for mode, arr in weighted_curves.items():
+            ax_linear.plot(wavelengths, arr, linewidth=1.0, alpha=0.88, label=f"{mode} weighted")
+        ax_linear.set_title("Source Spectrum (linear + weighted overlays)", fontsize=10, pad=10)
+        ax_linear.set_xlabel("Wavelength (nm)")
+        ax_linear.set_ylabel("Relative intensity (%)")
+        linear_xmin = max(190.0, float(np.min(wavelengths)))
+        linear_xmax = min(410.0, float(np.max(wavelengths)))
+        linear_ymax = max(110.0, all_max * 1.08)
+        ax_linear.set_xlim(linear_xmin, linear_xmax)
+        ax_linear.set_ylim(0.0, linear_ymax)
+        ax_linear.grid(True, alpha=0.3)
+        ax_linear.legend(loc="upper right", fontsize=7.8, ncol=2)
+
+        mask_log = (wavelengths >= 205.0) & (wavelengths <= 260.0)
+        if int(np.sum(mask_log)) < 2:
+            mask_log = np.isfinite(wavelengths)
+        x_log = wavelengths[mask_log]
+        curve_logs: List[np.ndarray] = [np.clip(normalized[mask_log], 1e-4, None)]
+        ax_log.plot(x_log, curve_logs[0], linewidth=1.25, label="Raw")
+        for mode, arr in weighted_curves.items():
+            arr_log = np.clip(arr[mask_log], 1e-4, None)
+            curve_logs.append(arr_log)
+            ax_log.plot(x_log, arr_log, linewidth=1.0, alpha=0.88, label=f"{mode} weighted")
+        y_min = min(float(np.nanmin(c)) for c in curve_logs)
+        y_max = max(float(np.nanmax(c)) for c in curve_logs)
+        ax_log.set_title("Source Spectrum (log detail + weighted overlays)", fontsize=10, pad=8)
+        ax_log.set_xlabel("Wavelength (nm)")
+        ax_log.set_ylabel("Relative intensity (%)")
+        ax_log.set_yscale("log")
+        if x_log.size >= 2:
+            ax_log.set_xlim(float(np.min(x_log)), float(np.max(x_log)))
+        log_ymin = max(1e-4, y_min * 0.9)
+        log_ymax = max(1.0, y_max * 1.2)
+        ax_log.set_ylim(log_ymin, log_ymax)
+        ax_log.grid(True, which="both", alpha=0.3)
+        ax_log.legend(loc="upper right", fontsize=7.8, ncol=2)
+
+        total_uv = self._integrate_spectrum_band(sweep, wavelengths, values, 200, 400)
+        far = self._integrate_spectrum_band(sweep, wavelengths, values, 200, 240)
+        high_s = self._integrate_spectrum_band(sweep, wavelengths, values, 240, 300)
+        uvc = self._integrate_spectrum_band(sweep, wavelengths, values, 200, 280)
+        uvb = self._integrate_spectrum_band(sweep, wavelengths, values, 280, 315)
+        uva = self._integrate_spectrum_band(sweep, wavelengths, values, 315, 400)
+
+        # Power bins table (legacy-style wavebands + selected/current integration totals).
+        ax_table.axis("off")
+        bin_cache: Dict[Tuple[float, float], Tuple[Optional[float], str]] = {}
+        for _name, band in REPORT_SPECTRAL_POWER_BINS:
+            bin_cache[band] = self._estimate_optical_power_mw_for_band(band, f"{band[0]:g}-{band[1]:g} nm")
+        total_uv_mw = bin_cache[(200.0, 400.0)][0]
+        full_spectrum_mw, full_spectrum_ctx = self._estimate_optical_power_mw_for_band(None, "full spectrum")
+        selected_mw, selected_ctx = self._estimate_total_optical_power_mw()
+        selected_band, selected_band_label, _selected_err = self._current_optical_power_band()
+
+        table_rows: List[List[str]] = []
+        for name, band in REPORT_SPECTRAL_POWER_BINS:
+            p_mw, _ctx = bin_cache.get(band, (None, ""))
+            band_txt = f"{name} ({band[0]:g}nm-{band[1]:g}nm)"
+            p_txt = f"{p_mw:.1f}" if isinstance(p_mw, (int, float)) and np.isfinite(float(p_mw)) else "n/a"
+            if (
+                isinstance(p_mw, (int, float))
+                and isinstance(total_uv_mw, (int, float))
+                and np.isfinite(float(total_uv_mw))
+                and float(total_uv_mw) > 0
+            ):
+                pct_txt = f"{(float(p_mw) / float(total_uv_mw)) * 100.0:.1f}"
+            else:
+                pct_txt = "n/a"
+            table_rows.append([band_txt, p_txt, pct_txt])
+
+        if isinstance(full_spectrum_mw, (int, float)) and np.isfinite(float(full_spectrum_mw)):
+            if isinstance(total_uv_mw, (int, float)) and np.isfinite(float(total_uv_mw)) and float(total_uv_mw) > 0:
+                full_pct_txt = f"{(float(full_spectrum_mw) / float(total_uv_mw)) * 100.0:.1f}"
+            else:
+                full_pct_txt = "n/a"
+            table_rows.append(["Full Spectrum (all wavelengths)", f"{float(full_spectrum_mw):.1f}", full_pct_txt])
+
+        if isinstance(selected_mw, (int, float)) and np.isfinite(float(selected_mw)):
+            sel_name = (
+                f"Selected Integration ({selected_band_label})"
+                if selected_band is not None
+                else "Selected Integration (full spectrum)"
+            )
+            if isinstance(total_uv_mw, (int, float)) and np.isfinite(float(total_uv_mw)) and float(total_uv_mw) > 0:
+                sel_pct_txt = f"{(float(selected_mw) / float(total_uv_mw)) * 100.0:.1f}"
+            else:
+                sel_pct_txt = "n/a"
+            table_rows.append([sel_name, f"{float(selected_mw):.1f}", sel_pct_txt])
+
+        tbl = ax_table.table(
+            cellText=table_rows,
+            colLabels=["Waveband", "Optical Power (mW)", "% of Total UV"],
+            cellLoc="left",
+            colLoc="left",
+            loc="upper center",
+            bbox=[0.0, 0.0, 1.0, 0.98],
+            colWidths=[0.50, 0.26, 0.24],
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8.8)
+        for (r, c), cell in tbl.get_celld().items():
+            if r == 0:
+                cell.set_text_props(weight="bold")
+            if c in (1, 2):
+                cell.get_text().set_ha("right")
+            cell.PAD = 0.10
+
+        if total_uv > 0:
+            msg = (
+                f"UV fractions from spectrum point: UVC {((uvc / total_uv) * 100):.1f}%, "
+                f"UVB {((uvb / total_uv) * 100):.1f}%, UVA {((uva / total_uv) * 100):.1f}%, "
+                f"Far-UVC {((far / total_uv) * 100):.1f}%, High-S(lambda) {((high_s / total_uv) * 100):.1f}%."
+            )
+        else:
+            msg = "Could not compute UV fractions from selected spectrum point."
+        if selected_mw is not None:
+            msg = f"{msg} Selected optical power: {selected_mw:.1f} mW ({selected_ctx})"
+        else:
+            msg = f"{msg} Selected optical power unavailable ({selected_ctx})"
+        if full_spectrum_mw is not None:
+            msg = f"{msg} Full-spectrum optical power: {full_spectrum_mw:.1f} mW ({full_spectrum_ctx})"
+        if total_uv_mw is not None:
+            msg = f"{msg} Total UV (200-400nm): {float(total_uv_mw):.1f} mW."
+        source_line = "; ".join(weighting_sources)
+        msg = (
+            f"{msg} Weighted overlays shown on linear/log plots: raw + IES/ANSI Eye + "
+            "IES/ANSI Skin + IEC (each normalized to S(222nm)). "
+            f"Curve source: {source_line}. "
+            "Use 'Open Linear' / 'Open Log' for dedicated pan/zoom views."
+        )
+        self._report_spectral_cache = {
+            "has_data": True,
+            "wavelengths": np.asarray(wavelengths, dtype=float),
+            "normalized": np.asarray(normalized, dtype=float),
+            "weighted_curves": {k: np.asarray(v, dtype=float) for k, v in weighted_curves.items()},
+            "mask_log": np.asarray(mask_log, dtype=bool),
+            "linear_ymax": float(linear_ymax),
+            "log_ymin": float(log_ymin),
+            "log_ymax": float(log_ymax),
+            "table_rows": [list(r) for r in table_rows],
+        }
+        self._preview_set_message("spectral", msg)
+        self._preview_draw("spectral")
+        return msg
+
+    def _refresh_report_exposure_preview(self) -> str:
+        """Render exposure-distance preview with selectable weighting mode."""
+        slot = self._report_preview_slot("exposure")
+        if not slot:
+            return "Exposure tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        mode = self.report_exposure_mode_var.get().strip() or "Unweighted"
+        rows, _used = self._collect_rows_from_segment_keys(["tight_web", "loose_web"])
+        if not rows:
+            ax.set_axis_off()
+            msg = "No web segments selected for exposure preview."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("exposure", msg)
+            self._preview_draw("exposure")
+            return msg
+
+        peak_1m = max(self._row_intensity_uW_cm2(r, normalize_to_1m=True) for r in rows)
+        if peak_1m <= 0:
+            ax.set_axis_off()
+            msg = "Peak intensity unavailable."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("exposure", msg)
+            self._preview_draw("exposure")
+            return msg
+
+        weight_factor = 1.0
+        source = "unweighted baseline"
+        if mode != "Unweighted":
+            spectral = self._selected_spectral_point_data()
+            if spectral:
+                weight_factor = self._compute_exposure_weighting_factor(
+                    mode,
+                    np.asarray(spectral["wavelengths"], dtype=float),
+                    np.asarray(spectral["values"], dtype=float),
+                )
+                source = self._weighting_curve_source(mode)
+            else:
+                source = "no spectrum point selected; fallback factor=1.0"
+
+        weighted_peak_1m = peak_1m * weight_factor
+        exposure_limit_uj_cm2 = 3000.0
+        horizon_h = 8.0
+        allowed_rate = exposure_limit_uj_cm2 / (horizon_h * 3600.0)
+        fail_safe_m = math.sqrt(weighted_peak_1m / allowed_rate) if weighted_peak_1m > 0 else float("nan")
+        base_distances = np.array([0.5, 1.0, 2.0, 3.0], dtype=float)
+        base_irradiances = weighted_peak_1m / (base_distances ** 2)
+        base_times_h = exposure_limit_uj_cm2 / (base_irradiances * 3600.0)
+
+        ax.plot(base_distances, base_irradiances, marker="o", linewidth=1.1)
+        if np.isfinite(fail_safe_m):
+            ax.axvline(fail_safe_m, linestyle="--", color="gray", alpha=0.5)
+            fail_safe_irr = weighted_peak_1m / (fail_safe_m ** 2)
+            ax.scatter([fail_safe_m], [fail_safe_irr], marker="D", s=32, color="#1f77b4", zorder=4)
+        ax.set_xlabel("Distance (m)")
+        ax.set_ylabel(f"Worst-case irradiance ({mode}, uW/cm^2)")
+        ax.set_title("Exposure Distance Model: E(d) = E(1m)/d^2", fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        text_rows = []
+        for d, irr, t_h in zip(base_distances, base_irradiances, base_times_h):
+            label = f"{d:.1f}m"
+            if t_h < horizon_h:
+                t_txt = f"{t_h:.2f}h"
+            else:
+                t_txt = ">=8h"
+            text_rows.append(f"{label}: {irr:.2f} uW/cm^2, limit in {t_txt}")
+        fail_safe_text = f"Fail-safe distance={fail_safe_m:.3f}m." if np.isfinite(fail_safe_m) else "Fail-safe distance unavailable."
+        msg = (
+            f"{mode} exposure preview using 3 mJ/cm^2 (8h) threshold. "
+            f"Spectrum-weight factor={weight_factor:.3f} ({source}). "
+            f"Weighted peak at 1m={weighted_peak_1m:.2f} uW/cm^2. "
+            + f"{fail_safe_text} "
+            + f"Examples: {' | '.join(text_rows[:3])}. "
+            + "Interpretation: distances at or beyond fail-safe are expected to remain within an 8-hour limit."
+        )
+        self._preview_set_message("exposure", msg)
+        self._preview_draw("exposure")
+        return msg
+
+    def _refresh_report_roll_preview(self) -> str:
+        """Render roll-dependence preview from selected web rows."""
+        slot = self._report_preview_slot("roll")
+        if not slot:
+            return "Roll tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        rows, _used = self._collect_rows_from_segment_keys(["tight_web", "loose_web"])
+        if not rows:
+            ax.set_axis_off()
+            msg = "No web rows selected for roll-dependence preview."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("roll", msg)
+            self._preview_draw("roll")
+            return msg
+
+        roll_map: Dict[float, List[float]] = {}
+        for row in rows:
+            coords = getattr(row, "coords", None)
+            if coords is None:
+                continue
+            yaw = getattr(coords, "yaw_deg", None)
+            roll = getattr(coords, "roll_deg", None)
+            if yaw is None or roll is None:
+                continue
+            if abs(float(yaw)) > 1e-3:
+                continue
+            val = self._row_intensity_uW_cm2(row, normalize_to_1m=True)
+            roll_map.setdefault(float(roll), []).append(val)
+        if not roll_map:
+            ax.set_axis_off()
+            msg = "No yaw=0 rows in selected web segments."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("roll", msg)
+            self._preview_draw("roll")
+            return msg
+
+        xs = sorted(roll_map.keys())
+        ys = [float(np.mean(roll_map[x])) for x in xs]
+        ax.plot(xs, ys, marker="o", markersize=2.5, linewidth=1.1)
+        ax.set_xlabel("Roll (deg)")
+        ax.set_ylabel("Irradiance at 1m (uW/cm^2)")
+        ax.grid(True, alpha=0.3)
+
+        zero_roll = self._nearest_value(xs, 0.0)
+        max_err = 0.0
+        if zero_roll is not None:
+            zero_v = ys[xs.index(zero_roll)]
+            if abs(zero_v) > 1e-9:
+                max_err = max(abs(y - zero_v) / abs(zero_v) * 100.0 for y in ys)
+        msg = f"Roll-dependence built from {len(xs)} roll points. Max deviation vs 0 deg: {max_err:.1f}%."
+        self._preview_set_message("roll", msg)
+        self._preview_draw("roll")
+        return msg
+
+    def _refresh_report_r2_preview(self) -> str:
+        """Render R² pullback preview."""
+        slot = self._report_preview_slot("r2")
+        if not slot:
+            return "R² tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        seg = self._resolve_report_segment("r2_pullback")
+        if not seg or not seg["rows"]:
+            ax.set_axis_off()
+            msg = "No R² pullback segment selected."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("r2", msg)
+            self._preview_draw("r2")
+            return msg
+
+        points: Dict[float, float] = {}
+        for row in seg["rows"]:
+            coords = getattr(row, "coords", None)
+            if coords is None:
+                continue
+            yaw = getattr(coords, "yaw_deg", None)
+            roll = getattr(coords, "roll_deg", None)
+            dist_mm = getattr(coords, "lin_mm", None)
+            if yaw is None or roll is None or dist_mm is None:
+                continue
+            if abs(float(yaw)) > 1e-3 or abs(float(roll)) > 1e-3:
+                continue
+            if float(dist_mm) <= 0:
+                continue
+            points[float(dist_mm)] = float(getattr(row.capture, "integral_result", 0.0) or 0.0) * WM2_TO_UW_CM2
+        if len(points) < 2:
+            ax.set_axis_off()
+            msg = "Need at least two 0 deg yaw/roll pullback points."
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            self._preview_set_message("r2", msg)
+            self._preview_draw("r2")
+            return msg
+
+        xs = np.asarray(sorted(points.keys()), dtype=float)
+        ys = np.asarray([points[x] for x in xs], dtype=float)
+        y_fit = ys[-1] * (xs[-1] / xs) ** 2
+        ax.plot(xs, y_fit, linewidth=1.1, label="Ideal 1/r^2")
+        ax.scatter(xs, ys, s=18, marker="x", label="Measured")
+        ax.set_xlabel("Distance (mm)")
+        ax.set_ylabel("Irradiance (uW/cm^2)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+        ss_res = float(np.sum((ys - y_fit) ** 2))
+        ss_tot = float(np.sum((ys - float(np.mean(ys))) ** 2))
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else float("nan")
+        msg = f"R² pullback points: {len(xs)}. Model fit score (R²): {r2:.4f}."
+        self._preview_set_message("r2", msg)
+        self._preview_draw("r2")
+        return msg
+
+    def _refresh_report_electrical_preview(self) -> str:
+        """Render electrical preview from selected report CSV roles."""
+        slot = self._report_preview_slot("electrical")
+        if not slot:
+            return "Electrical tab unavailable."
+        fig: Figure = slot["figure"]  # type: ignore[assignment]
+        fig.clear()
+        ax_top = fig.add_subplot(211)
+        ax_bottom = fig.add_subplot(212)
+        ax_bottom_twin = ax_bottom.twinx()
+
+        power_log = next((rec for rec in self.report_csvs.values() if rec.role == "Power Log"), None)
+        power_wfm = next((rec for rec in self.report_csvs.values() if rec.role == "Power Waveform"), None)
+
+        summary_lines: List[str] = []
+        plotted = False
+
+        if power_log is not None:
+            try:
+                df = self._read_report_csv_frame(power_log.path)
+                cols = list(df.columns)
+                ts_col = self._find_csv_column(cols, ["timestamp", "epoch", "time"])
+                active_col = self._find_csv_column(cols, ["w_active", "active"])
+                apparent_col = self._find_csv_column(cols, ["w_apparent", "apparent"])
+                v_col = self._find_csv_column(cols, ["v_rms", "vrms", "voltage"])
+                i_col = self._find_csv_column(cols, ["i_rms", "irms", "current"])
+                pf_col = self._find_csv_column(cols, ["pfactor", "power_factor", "pf"])
+                freq_col = self._find_csv_column(cols, ["v_freq", "freq", "hz"])
+                vthd_col = self._find_csv_column(cols, ["v_thd", "voltage_thd", "v_thd-f"])
+                ithd_col = self._find_csv_column(cols, ["i_thd", "current_thd", "i_thd-f"])
+
+                s_ts = self._series_numeric(df, ts_col)
+                s_active = self._series_numeric(df, active_col)
+                s_apparent = self._series_numeric(df, apparent_col)
+                power_series = s_active if s_active is not None else s_apparent
+                if s_ts is not None and power_series is not None:
+                    n = min(len(s_ts), len(power_series))
+                    x = s_ts.iloc[:n].to_numpy(dtype=float)
+                    y = power_series.iloc[:n].to_numpy(dtype=float)
+                    if n > 1:
+                        x = (x - x[0]) / 60.0
+                        ax_top.plot(x, y, linewidth=1.0)
+                        ax_top.set_xlabel("Elapsed time (min)")
+                        ax_top.set_ylabel("Power (W)")
+                        ax_top.grid(True, alpha=0.3)
+                        plotted = True
+
+                if s_active is not None:
+                    summary_lines.append(f"Active power avg: {float(np.mean(s_active)):.2f} W")
+                if s_apparent is not None:
+                    summary_lines.append(f"Apparent power avg: {float(np.mean(s_apparent)):.2f} W")
+                s_v = self._series_numeric(df, v_col)
+                s_i = self._series_numeric(df, i_col)
+                s_pf = self._series_numeric(df, pf_col)
+                s_freq = self._series_numeric(df, freq_col)
+                s_vthd = self._series_numeric(df, vthd_col)
+                s_ithd = self._series_numeric(df, ithd_col)
+                if s_v is not None:
+                    summary_lines.append(f"Voltage RMS avg: {float(np.mean(s_v)):.2f} V")
+                if s_i is not None:
+                    summary_lines.append(f"Current RMS avg: {float(np.mean(s_i)):.3f} A")
+                if s_pf is not None:
+                    summary_lines.append(f"Power factor avg: {float(np.mean(s_pf)):.3f}")
+                if s_freq is not None:
+                    summary_lines.append(f"Frequency avg: {float(np.mean(s_freq)):.3f} Hz")
+                if s_vthd is not None:
+                    summary_lines.append(f"Voltage THD max: {float(np.max(s_vthd))*100.0:.2f}%")
+                if s_ithd is not None:
+                    summary_lines.append(f"Current THD avg: {float(np.mean(s_ithd))*100.0:.2f}%")
+            except Exception as e:
+                summary_lines.append(f"Power log parse failed: {e}")
+
+        if power_wfm is not None:
+            try:
+                dfw = self._read_report_csv_frame(power_wfm.path)
+                cols = list(dfw.columns)
+                t_col = self._find_csv_column(cols, ["time", "timestamp", "t"]) or (cols[0] if cols else None)
+                v_col = self._find_csv_column(cols, ["voltage", "v_rms", "vrms", "v"]) or (cols[1] if len(cols) > 1 else None)
+                i_col = self._find_csv_column(cols, ["current", "i_rms", "irms", "i"]) or (cols[2] if len(cols) > 2 else None)
+                s_t = self._series_numeric(dfw, t_col)
+                s_v = self._series_numeric(dfw, v_col)
+                s_i = self._series_numeric(dfw, i_col)
+                if s_t is not None and s_v is not None and s_i is not None:
+                    n = min(len(s_t), len(s_v), len(s_i))
+                    if n > 1:
+                        x = s_t.iloc[:n].to_numpy(dtype=float) * 1000.0
+                        yv = s_v.iloc[:n].to_numpy(dtype=float)
+                        yi = s_i.iloc[:n].to_numpy(dtype=float)
+                        ax_bottom.plot(x, yi, linewidth=1.0, color="#2a9d8f", label="Current")
+                        ax_bottom_twin.plot(x, yv, linewidth=1.0, color="#264653", label="Voltage")
+                        ax_bottom.set_xlabel("Waveform time (ms)")
+                        ax_bottom.set_ylabel("Current (A)", color="#2a9d8f")
+                        ax_bottom_twin.set_ylabel("Voltage (V)", color="#264653")
+                        ax_bottom.grid(True, alpha=0.3)
+                        plotted = True
+                else:
+                    summary_lines.append("Waveform CSV missing usable Time/V/I columns.")
+            except Exception as e:
+                summary_lines.append(f"Waveform parse failed: {e}")
+
+        if not plotted:
+            ax_top.set_axis_off()
+            ax_bottom.set_axis_off()
+            ax_bottom_twin.set_axis_off()
+            ax_top.text(0.5, 0.5, "No electrical preview data.", ha="center", va="center", transform=ax_top.transAxes)
+
+        summary = "\n".join(summary_lines) if summary_lines else "No electrical metrics available."
+        self.report_electrical_summary_var.set(summary)
+        msg = "Electrical preview refreshed."
+        self._preview_set_message("electrical", msg)
+        self._preview_draw("electrical")
+        return summary_lines[0] if summary_lines else msg
 
     # ---- Report Builder actions ----
     def on_add_report_sw3_files(self):
@@ -1716,8 +3878,14 @@ class App(tk.Tk):
                 phases=phases,
                 phase_tags=phase_tags,
             )
+            self._report_sweep_cache[scan_id] = sweep
             n += 1
         if n:
+            if not self.report_meta_vars["reporting_name"].get().strip() and self.report_scans:
+                first = next(iter(self.report_scans.values()))
+                self.report_meta_vars["reporting_name"].set(first.label)
+                if not self.report_meta_vars["acq_name"].get().strip():
+                    self.report_meta_vars["acq_name"].set(first.label)
             self._refresh_report_scans_tv()
             self._refresh_report_segment_selectors()
             self._set_status(f"Added {n} report scan(s).")
@@ -1757,6 +3925,7 @@ class App(tk.Tk):
             return
         for sid in sel:
             self.report_scans.pop(sid, None)
+            self._report_sweep_cache.pop(sid, None)
             if self._report_selected_scan_id == sid:
                 self._report_selected_scan_id = None
         self._refresh_report_scans_tv()
@@ -1995,6 +4164,7 @@ class App(tk.Tk):
             self.report_segment_selection[seg_key] = seg_id
         else:
             self.report_segment_selection.pop(seg_key, None)
+        self._report_pattern_cache = {}
 
     def _phase_tag_for_record(self, rec: ReportScanRecord, idx: int, phase: Dict[str, object]) -> str:
         """Return explicit phase tag or inferred fallback."""
@@ -2108,6 +4278,7 @@ class App(tk.Tk):
                         target_display = disp
                         break
             self.report_segment_choice_vars[seg_key].set(target_display)
+        self._report_pattern_cache = {}
 
     def _summarize_scan_phases(self, sweep) -> List[Dict[str, object]]:
         """Return a list of phase summaries for a scan."""
@@ -3054,6 +5225,13 @@ class App(tk.Tk):
                 "segment_selection": dict(self.report_segment_selection),
                 "lamp_image_path": self.report_lamp_image_path_var.get(),
                 "axes_image_path": self.report_axes_image_path_var.get(),
+                "exposure_mode": self.report_exposure_mode_var.get(),
+                "optical_power_mode": self.report_optical_power_mode_var.get(),
+                "optical_power_min_nm": self.report_optical_power_min_nm_var.get(),
+                "optical_power_max_nm": self.report_optical_power_max_nm_var.get(),
+                "pattern_plane_idx": int(self.report_pattern_plane_idx_var.get()),
+                "metadata": self._collect_report_metadata(),
+                "comments": self._collect_report_comments(),
             }
         }
         with open(path, "w") as fd: json.dump(data, fd, indent=2)
@@ -3096,6 +5274,24 @@ class App(tk.Tk):
         }
         self.report_lamp_image_path_var.set(str(report.get("lamp_image_path", "") or ""))
         self.report_axes_image_path_var.set(str(report.get("axes_image_path", "") or ""))
+        saved_exposure_mode = str(report.get("exposure_mode", "") or "").strip()
+        self.report_exposure_mode_var.set(saved_exposure_mode if saved_exposure_mode in REPORT_EXPOSURE_MODES else "IEC")
+        saved_power_mode = str(report.get("optical_power_mode", "") or "").strip()
+        self.report_optical_power_mode_var.set(
+            saved_power_mode if saved_power_mode in REPORT_OPTICAL_POWER_MODES else "Band"
+        )
+        self.report_optical_power_min_nm_var.set(str(report.get("optical_power_min_nm", "200") or "200"))
+        self.report_optical_power_max_nm_var.set(str(report.get("optical_power_max_nm", "230") or "230"))
+        self.report_pattern_plane_idx_var.set(int(report.get("pattern_plane_idx", 0) or 0))
+        self._sync_report_optical_power_controls()
+        self._sync_report_pattern_plane_controls([], int(self.report_pattern_plane_idx_var.get()))
+        self._apply_report_metadata(report.get("metadata", {}))
+        self._apply_report_comments(report.get("comments", {}))
+        self._report_sweep_cache.clear()
+        self._report_spectral_cache = {}
+        self._report_pattern_cache = {}
+        self.report_preview_status_var.set("Preview not generated.")
+        self.report_electrical_summary_var.set("No electrical summary yet.")
         self._report_selected_scan_id = None
         c = data.get("controls", {})
         def set_if(k,var):

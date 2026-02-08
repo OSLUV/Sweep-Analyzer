@@ -1,6 +1,7 @@
 import unittest
 
 from gui import (
+    choose_pattern_display_planes,
     choose_latest_full_hour_warmup_segment_id,
     report_segment_key_for_phase,
     suggest_report_phase_tag,
@@ -125,6 +126,24 @@ class TestReportPhaseTagging(unittest.TestCase):
 
     def test_warmup_selector_handles_empty_list(self):
         self.assertIsNone(choose_latest_full_hour_warmup_segment_id([]))
+
+    def test_pattern_plane_selector_includes_custom_plane(self):
+        rolls, planes, idx = choose_pattern_display_planes([0.0, 15.0, 30.0, 90.0], 2)
+        self.assertEqual(rolls, [0.0, 15.0, 30.0, 90.0])
+        self.assertEqual(idx, 2)
+        self.assertEqual(planes, [0.0, 90.0, 30.0])
+
+    def test_pattern_plane_selector_clamps_and_dedupes(self):
+        rolls, planes, idx = choose_pattern_display_planes([2.0, 89.0], 100)
+        self.assertEqual(rolls, [2.0, 89.0])
+        self.assertEqual(idx, 1)
+        self.assertEqual(planes, [2.0, 89.0])
+
+    def test_pattern_plane_selector_handles_empty_values(self):
+        rolls, planes, idx = choose_pattern_display_planes([], 0)
+        self.assertEqual(rolls, [])
+        self.assertEqual(planes, [])
+        self.assertEqual(idx, 0)
 
 
 if __name__ == "__main__":
